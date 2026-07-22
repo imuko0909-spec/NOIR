@@ -17,20 +17,20 @@ from discord.ext import commands
 
 TOKEN = os.getenv("DISCORD_TOKEN", "ここにBOTトークン")
 
-GUILD_ID = 1158165775518011455
+GUILD_ID = 1482224471606820874
 
 # 作成先カテゴリ
-QUICK_PUBLIC_CATEGORY_ID = 0       # 表マイリスト・表QM・表時間制
-QUICK_PRIVATE_CATEGORY_ID = 0      # 裏マイリスト・裏時間制・添い寝・エロイプ・裏QM
-PRIVATE_PUBLIC_CATEGORY_ID = 0     # 表個室
-PRIVATE_HIDDEN_CATEGORY_ID = 0     # 裏個室
+QUICK_PUBLIC_CATEGORY_ID = 1521453832788246690       # 表マイリスト・表QM・表時間制
+QUICK_PRIVATE_CATEGORY_ID = 1516009559892951060      # 裏マイリスト・裏時間制・添い寝・エロイプ・裏QM
+PRIVATE_PUBLIC_CATEGORY_ID = 1521453832788246690     # 表個室
+PRIVATE_HIDDEN_CATEGORY_ID = 1482309197814038538     # 裏個室
 
 # 性別ロール（裏QMの「異性にだけ見える」に使用）
-MALE_ROLE_ID = 0
-FEMALE_ROLE_ID = 0
+MALE_ROLE_ID = 1482301549353897984
+FEMALE_ROLE_ID = 1523690396515962981
 
 # Bot管理者ロール。0の場合は「管理者」権限のみ
-BOT_ADMIN_ROLE_ID = 0
+BOT_ADMIN_ROLE_ID = 1482306904918327336
 
 # 時間制部屋
 TIMED_ROOM_SECONDS = 10 * 60
@@ -1065,11 +1065,38 @@ class RoomBot(commands.Bot):
 
         guild_obj = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild_obj)
-        synced = await self.tree.sync(guild=guild_obj)
-        log.info("%s個のコマンドを同期しました", len(synced))
+
+        try:
+            synced = await self.tree.sync(guild=guild_obj)
+            log.info(
+                "%s個のコマンドをGuild %sへ同期しました",
+                len(synced),
+                GUILD_ID,
+            )
+        except discord.Forbidden:
+            log.exception(
+                "Guildコマンド同期に失敗しました。"
+                "RenderのDISCORD_TOKENが、このサーバーに参加しているBotのものか確認してください。"
+                "またBotを bot + applications.commands の両方のScopeで招待してください。"
+            )
+        except discord.HTTPException:
+            log.exception("Discord APIエラーによりコマンド同期に失敗しました。")
 
     async def on_ready(self) -> None:
-        log.info("ログイン: %s (%s)", self.user, self.user.id if self.user else "?")
+        log.info("ログインBot: %s", self.user)
+        log.info("BotユーザーID: %s", self.user.id if self.user else "?")
+        log.info("設定Guild ID: %s", GUILD_ID)
+
+        guild = self.get_guild(GUILD_ID)
+        if guild is None:
+            log.error(
+                "設定したGuildが見つかりません。"
+                "このトークンのBotがGuild %sへ参加しているか確認してください。",
+                GUILD_ID,
+            )
+        else:
+            log.info("接続Guild: %s (%s)", guild.name, guild.id)
+
         await self.cleanup_missing_rooms()
 
     async def cleanup_missing_rooms(self) -> None:
