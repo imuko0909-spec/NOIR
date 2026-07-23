@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import asyncio
@@ -5,6 +6,7 @@ import logging
 import os
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 import discord
@@ -12,43 +14,48 @@ from discord import app_commands
 from discord.ext import commands
 
 # =========================================================
-# 設定：ここだけ変更してください
+# Midnight NOIR Bot - 1ファイル版
 # =========================================================
 
 TOKEN = os.getenv("DISCORD_TOKEN", "ここにBOTトークン")
-
 GUILD_ID = 1482224471606820874
 
-# 作成先カテゴリ
-QUICK_PUBLIC_CATEGORY_ID = 1521453832788246690       # 表マイリスト・表QM・表時間制
-QUICK_PRIVATE_CATEGORY_ID = 1516009559892951060      # 裏マイリスト・裏時間制・添い寝・エロイプ・裏QM
-PRIVATE_PUBLIC_CATEGORY_ID = 1521453832788246690     # 表個室
-PRIVATE_HIDDEN_CATEGORY_ID = 1482309197814038538     # 裏個室
+# VCカテゴリ
+QUICK_PUBLIC_CATEGORY_ID = 1521453832788246690
+QUICK_PRIVATE_CATEGORY_ID = 1516009559892951060
+PRIVATE_PUBLIC_CATEGORY_ID = 1521453832788246690
+PRIVATE_HIDDEN_CATEGORY_ID = 1482309197814038538
 
-# 性別ロール（裏QMの「異性にだけ見える」に使用）
+# 性別・管理ロール
 MALE_ROLE_ID = 1482301549353897984
 FEMALE_ROLE_ID = 1523690396515962981
-
-# Bot管理者ロール。0の場合は「管理者」権限のみ
 BOT_ADMIN_ROLE_ID = 1482306904918327336
 
-# 時間制部屋
+# なう募集
+NOW_RECRUIT_CHANNEL_ID = 1521066957103693965
+MALE_PROFILE_CHANNEL_ID = 1482301104258547863
+FEMALE_PROFILE_CHANNEL_ID = 1482301192263569522
+MALE_NOTIFY_ROLE_ID = 1482301549353897984
+FEMALE_NOTIFY_ROLE_ID = 1523690396515962981
+
+# 裏募集
+RECRUIT_CREATE_PANEL_CHANNEL_ID = 1524090558518132907
+RECRUIT_CONFIRM_CHANNEL_ID = 1529514190497386606
+RECRUIT_NOTIFICATION_CHANNEL_ID = 1521066957103693965
+RECRUIT_LOG_CHANNEL_ID = 1529623100986097764
+ANONYMOUS_NOTIFY_ROLE_ID = 1529620347157217331
+NAMED_NOTIFY_ROLE_ID = 1529620408951771306
+
 TIMED_ROOM_SECONDS = 10 * 60
-
-# 空室になってから削除するまで
 EMPTY_DELETE_SECONDS = 15
-
 DATABASE_PATH = "room_bot.sqlite3"
-
-# =========================================================
-# ログ
-# =========================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-log = logging.getLogger("room-bot")
+log = logging.getLogger("noir-bot")
+
 
 # =========================================================
 # DB
@@ -85,15 +92,58 @@ def init_db() -> None:
                 timed INTEGER NOT NULL DEFAULT 0,
                 timer_started INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS now_recruitments (
+                message_id INTEGER PRIMARY KEY,
+                owner_id INTEGER NOT NULL,
+                target_type TEXT NOT NULL,
+                comment TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS recruit_profiles (
+                user_id INTEGER PRIMARY KEY,
+                age TEXT NOT NULL DEFAULT '',
+                voice TEXT NOT NULL DEFAULT '',
+                personality TEXT NOT NULL DEFAULT '',
+                style TEXT NOT NULL DEFAULT '',
+                comment TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS recruitments (
+                message_id INTEGER PRIMARY KEY,
+                owner_id INTEGER NOT NULL,
+                mode TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                conditions TEXT NOT NULL,
+                mylist_only INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS applications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_message_id INTEGER NOT NULL,
+                owner_id INTEGER NOT NULL,
+                applicant_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL
+            );
             """
         )
 
 
-def add_favorite(owner_id: int, target_id: int) -> bool:
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def add_pair(table: str, owner_id: int, target_id: int) -> bool:
     try:
         with db_connect() as con:
             con.execute(
-                "INSERT INTO favorites(owner_id, target_id) VALUES (?, ?)",
+                f"INSERT INTO {table}(owner_id, target_id) VALUES (?, ?)",
                 (owner_id, target_id),
             )
         return True
@@ -101,60 +151,29 @@ def add_favorite(owner_id: int, target_id: int) -> bool:
         return False
 
 
-def remove_favorite(owner_id: int, target_id: int) -> bool:
+def remove_pair(table: str, owner_id: int, target_id: int) -> bool:
     with db_connect() as con:
         cur = con.execute(
-            "DELETE FROM favorites WHERE owner_id=? AND target_id=?",
+            f"DELETE FROM {table} WHERE owner_id=? AND target_id=?",
             (owner_id, target_id),
         )
         return cur.rowcount > 0
 
 
-def get_favorites(owner_id: int) -> list[int]:
+def get_pairs(table: str, owner_id: int) -> list[int]:
     with db_connect() as con:
         rows = con.execute(
-            "SELECT target_id FROM favorites WHERE owner_id=? ORDER BY target_id",
+            f"SELECT target_id FROM {table} WHERE owner_id=? ORDER BY target_id",
             (owner_id,),
         ).fetchall()
-    return [int(r["target_id"]) for r in rows]
-
-
-def add_blacklist(owner_id: int, target_id: int) -> bool:
-    try:
-        with db_connect() as con:
-            con.execute(
-                "INSERT INTO blacklist(owner_id, target_id) VALUES (?, ?)",
-                (owner_id, target_id),
-            )
-        return True
-    except sqlite3.IntegrityError:
-        return False
-
-
-def remove_blacklist(owner_id: int, target_id: int) -> bool:
-    with db_connect() as con:
-        cur = con.execute(
-            "DELETE FROM blacklist WHERE owner_id=? AND target_id=?",
-            (owner_id, target_id),
-        )
-        return cur.rowcount > 0
-
-
-def get_blacklist(owner_id: int) -> list[int]:
-    with db_connect() as con:
-        rows = con.execute(
-            "SELECT target_id FROM blacklist WHERE owner_id=? ORDER BY target_id",
-            (owner_id,),
-        ).fetchall()
-    return [int(r["target_id"]) for r in rows]
+    return [int(row["target_id"]) for row in rows]
 
 
 def is_blocked_either_way(user_a: int, user_b: int) -> bool:
     with db_connect() as con:
         row = con.execute(
             """
-            SELECT 1
-            FROM blacklist
+            SELECT 1 FROM blacklist
             WHERE (owner_id=? AND target_id=?)
                OR (owner_id=? AND target_id=?)
             LIMIT 1
@@ -179,27 +198,7 @@ def save_room(
             (channel_id, guild_id, owner_id, room_type, hidden_when_two, timed, timer_started)
             VALUES (?, ?, ?, ?, ?, ?, 0)
             """,
-            (
-                channel_id,
-                guild_id,
-                owner_id,
-                room_type,
-                int(hidden_when_two),
-                int(timed),
-            ),
-        )
-
-
-def delete_room_record(channel_id: int) -> None:
-    with db_connect() as con:
-        con.execute("DELETE FROM rooms WHERE channel_id=?", (channel_id,))
-
-
-def set_timer_started(channel_id: int, started: bool) -> None:
-    with db_connect() as con:
-        con.execute(
-            "UPDATE rooms SET timer_started=? WHERE channel_id=?",
-            (int(started), channel_id),
+            (channel_id, guild_id, owner_id, room_type, int(hidden_when_two), int(timed)),
         )
 
 
@@ -216,6 +215,122 @@ def all_rooms() -> list[sqlite3.Row]:
         return con.execute("SELECT * FROM rooms").fetchall()
 
 
+def delete_room_record(channel_id: int) -> None:
+    with db_connect() as con:
+        con.execute("DELETE FROM rooms WHERE channel_id=?", (channel_id,))
+
+
+def set_timer_started(channel_id: int, value: bool) -> None:
+    with db_connect() as con:
+        con.execute(
+            "UPDATE rooms SET timer_started=? WHERE channel_id=?",
+            (int(value), channel_id),
+        )
+
+
+def save_now_recruitment(message_id: int, owner_id: int, target_type: str, comment: str) -> None:
+    with db_connect() as con:
+        con.execute(
+            """
+            INSERT OR REPLACE INTO now_recruitments
+            (message_id, owner_id, target_type, comment, active, created_at)
+            VALUES (?, ?, ?, ?, 1, ?)
+            """,
+            (message_id, owner_id, target_type, comment, utc_now()),
+        )
+
+
+def get_now_recruitment(message_id: int) -> Optional[sqlite3.Row]:
+    with db_connect() as con:
+        return con.execute(
+            "SELECT * FROM now_recruitments WHERE message_id=?",
+            (message_id,),
+        ).fetchone()
+
+
+def close_now_recruitment(message_id: int) -> None:
+    with db_connect() as con:
+        con.execute(
+            "UPDATE now_recruitments SET active=0 WHERE message_id=?",
+            (message_id,),
+        )
+
+
+def save_recruitment(
+    message_id: int,
+    owner_id: int,
+    mode: str,
+    title: str,
+    body: str,
+    conditions: str,
+    mylist_only: bool,
+) -> None:
+    with db_connect() as con:
+        con.execute(
+            """
+            INSERT OR REPLACE INTO recruitments
+            (message_id, owner_id, mode, title, body, conditions, mylist_only, active, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+            """,
+            (message_id, owner_id, mode, title, body, conditions, int(mylist_only), utc_now()),
+        )
+
+
+def get_recruitment(message_id: int) -> Optional[sqlite3.Row]:
+    with db_connect() as con:
+        return con.execute(
+            "SELECT * FROM recruitments WHERE message_id=?",
+            (message_id,),
+        ).fetchone()
+
+
+def close_recruitment(message_id: int) -> None:
+    with db_connect() as con:
+        con.execute(
+            "UPDATE recruitments SET active=0 WHERE message_id=?",
+            (message_id,),
+        )
+
+
+def create_application(source_message_id: int, owner_id: int, applicant_id: int) -> int:
+    with db_connect() as con:
+        old = con.execute(
+            """
+            SELECT id FROM applications
+            WHERE source_message_id=? AND applicant_id=? AND status='pending'
+            """,
+            (source_message_id, applicant_id),
+        ).fetchone()
+        if old:
+            return int(old["id"])
+
+        cur = con.execute(
+            """
+            INSERT INTO applications
+            (source_message_id, owner_id, applicant_id, status, created_at)
+            VALUES (?, ?, ?, 'pending', ?)
+            """,
+            (source_message_id, owner_id, applicant_id, utc_now()),
+        )
+        return int(cur.lastrowid)
+
+
+def get_application(application_id: int) -> Optional[sqlite3.Row]:
+    with db_connect() as con:
+        return con.execute(
+            "SELECT * FROM applications WHERE id=?",
+            (application_id,),
+        ).fetchone()
+
+
+def update_application(application_id: int, status: str) -> None:
+    with db_connect() as con:
+        con.execute(
+            "UPDATE applications SET status=? WHERE id=?",
+            (status, application_id),
+        )
+
+
 # =========================================================
 # 共通
 # =========================================================
@@ -230,20 +345,24 @@ class RoomSpec:
     timed: bool = False
     user_limit: int = 0
     opposite_gender_only: bool = False
-    knock: bool = False
 
 
 def clean_channel_name(text: str) -> str:
-    forbidden = "/\\#,:`"
-    for char in forbidden:
+    for char in "/\\#,:`":
         text = text.replace(char, " ")
     return " ".join(text.split())[:90] or "個室"
 
 
 def is_bot_admin(member: discord.Member) -> bool:
-    if member.guild_permissions.administrator:
-        return True
-    return bool(BOT_ADMIN_ROLE_ID and member.get_role(BOT_ADMIN_ROLE_ID))
+    return (
+        member.guild_permissions.administrator
+        or bool(BOT_ADMIN_ROLE_ID and member.get_role(BOT_ADMIN_ROLE_ID))
+    )
+
+
+def get_text_channel(guild: discord.Guild, channel_id: int) -> Optional[discord.TextChannel]:
+    channel = guild.get_channel(channel_id)
+    return channel if isinstance(channel, discord.TextChannel) else None
 
 
 def get_category(guild: discord.Guild, category_id: int) -> Optional[discord.CategoryChannel]:
@@ -251,46 +370,36 @@ def get_category(guild: discord.Guild, category_id: int) -> Optional[discord.Cat
     return channel if isinstance(channel, discord.CategoryChannel) else None
 
 
-def base_bot_overwrite() -> discord.PermissionOverwrite:
-    return discord.PermissionOverwrite(
-        view_channel=True,
-        connect=True,
-        move_members=True,
-        manage_channels=True,
-        manage_permissions=True,
+def profile_channel_for(member: discord.Member) -> Optional[discord.TextChannel]:
+    if member.get_role(MALE_ROLE_ID):
+        return get_text_channel(member.guild, MALE_PROFILE_CHANNEL_ID)
+    if member.get_role(FEMALE_ROLE_ID):
+        return get_text_channel(member.guild, FEMALE_PROFILE_CHANNEL_ID)
+    return None
+
+
+def target_role_and_label(guild: discord.Guild, target_type: str) -> tuple[str, str]:
+    male = guild.get_role(MALE_NOTIFY_ROLE_ID)
+    female = guild.get_role(FEMALE_NOTIFY_ROLE_ID)
+
+    if target_type == "male":
+        return (male.mention if male else "", "男性宛")
+    if target_type == "female":
+        return (female.mention if female else "", "女性宛")
+
+    mentions = " ".join(
+        role.mention for role in (male, female) if role is not None
     )
+    return mentions, "全員宛"
 
 
-async def safe_set_voice_status(channel: discord.VoiceChannel, status: str) -> None:
-    """
-    discord.pyのバージョンによってはVoiceChannel.set_statusが未実装です。
-    利用可能な場合だけ実行し、失敗しても部屋作成は継続します。
-    """
-    setter = getattr(channel, "set_status", None)
-    if setter is None:
-        return
-    try:
-        await setter(status=status[:500])
-    except Exception:
-        log.exception("VCステータス設定に失敗: channel=%s", channel.id)
-
-
-def blocked_members_for_owner(guild: discord.Guild, owner_id: int) -> list[discord.Member]:
-    ids = set(get_blacklist(owner_id))
-    # 相手側からownerがブロックされている場合も除外
-    with db_connect() as con:
-        rows = con.execute(
-            "SELECT owner_id FROM blacklist WHERE target_id=?",
-            (owner_id,),
-        ).fetchall()
-    ids.update(int(r["owner_id"]) for r in rows)
-
-    members: list[discord.Member] = []
-    for user_id in ids:
-        member = guild.get_member(user_id)
-        if member:
-            members.append(member)
-    return members
+async def send_log(guild: discord.Guild, text: str) -> None:
+    channel = get_text_channel(guild, RECRUIT_LOG_CHANNEL_ID)
+    if channel:
+        try:
+            await channel.send(text)
+        except discord.HTTPException:
+            log.exception("ログ送信失敗")
 
 
 async def create_room(
@@ -298,7 +407,6 @@ async def create_room(
     spec: RoomSpec,
     *,
     allowed_members: Optional[list[discord.Member]] = None,
-    status: Optional[str] = None,
 ) -> Optional[discord.VoiceChannel]:
     guild = interaction.guild
     owner = interaction.user
@@ -310,53 +418,39 @@ async def create_room(
     category = get_category(guild, spec.category_id)
     if category is None:
         await interaction.followup.send(
-            f"作成先カテゴリID `{spec.category_id}` が設定されていません。",
+            f"作成先カテゴリ `{spec.category_id}` が見つかりません。",
             ephemeral=True,
         )
         return None
 
-    allowed_members = allowed_members or []
-    # 重複排除
-    unique: dict[int, discord.Member] = {owner.id: owner}
-    for member in allowed_members:
-        if not member.bot:
-            unique[member.id] = member
-    allowed_members = list(unique.values())
-
     everyone = guild.default_role
-    bot_member = guild.me
-    overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {}
-
-    if spec.public_view:
-        overwrites[everyone] = discord.PermissionOverwrite(
+    overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+        everyone: discord.PermissionOverwrite(
+            view_channel=spec.public_view,
+            connect=False,
+        ),
+        owner: discord.PermissionOverwrite(
             view_channel=True,
-            connect=False,
+            connect=True,
+            speak=True,
+            stream=True,
+            use_voice_activation=True,
+            manage_channels=True,
+            move_members=True,
+        ),
+    }
+
+    if guild.me:
+        overwrites[guild.me] = discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            move_members=True,
+            manage_channels=True,
+            manage_permissions=True,
         )
-    else:
-        overwrites[everyone] = discord.PermissionOverwrite(
-            view_channel=False,
-            connect=False,
-        )
 
-    if bot_member:
-        overwrites[bot_member] = base_bot_overwrite()
-
-    # 作成者
-    overwrites[owner] = discord.PermissionOverwrite(
-        view_channel=True,
-        connect=True,
-        speak=True,
-        stream=True,
-        use_voice_activation=True,
-        manage_channels=True,
-        move_members=True,
-    )
-
-    # 指定メンバー
-    for member in allowed_members:
-        if member.id == owner.id:
-            continue
-        if is_blocked_either_way(owner.id, member.id):
+    for member in allowed_members or []:
+        if member.bot or member.id == owner.id or is_blocked_either_way(owner.id, member.id):
             continue
         overwrites[member] = discord.PermissionOverwrite(
             view_channel=True,
@@ -366,40 +460,21 @@ async def create_room(
             use_voice_activation=True,
         )
 
-    # 裏QM：作成者の異性ロールだけ許可
     if spec.opposite_gender_only:
-        male_role = guild.get_role(MALE_ROLE_ID) if MALE_ROLE_ID else None
-        female_role = guild.get_role(FEMALE_ROLE_ID) if FEMALE_ROLE_ID else None
+        male = guild.get_role(MALE_ROLE_ID)
+        female = guild.get_role(FEMALE_ROLE_ID)
+        if male and female:
+            if male in owner.roles:
+                overwrites[female] = discord.PermissionOverwrite(view_channel=True, connect=True)
+                overwrites[male] = discord.PermissionOverwrite(view_channel=False, connect=False)
+            elif female in owner.roles:
+                overwrites[male] = discord.PermissionOverwrite(view_channel=True, connect=True)
+                overwrites[female] = discord.PermissionOverwrite(view_channel=False, connect=False)
 
-        if male_role and female_role:
-            owner_is_male = male_role in owner.roles
-            owner_is_female = female_role in owner.roles
-
-            if owner_is_male:
-                overwrites[female_role] = discord.PermissionOverwrite(
-                    view_channel=True,
-                    connect=True,
-                )
-                overwrites[male_role] = discord.PermissionOverwrite(
-                    view_channel=False,
-                    connect=False,
-                )
-            elif owner_is_female:
-                overwrites[male_role] = discord.PermissionOverwrite(
-                    view_channel=True,
-                    connect=True,
-                )
-                overwrites[female_role] = discord.PermissionOverwrite(
-                    view_channel=False,
-                    connect=False,
-                )
-
-    # ブラックリストは常に明示拒否
-    for blocked in blocked_members_for_owner(guild, owner.id):
-        overwrites[blocked] = discord.PermissionOverwrite(
-            view_channel=False,
-            connect=False,
-        )
+    for blocked_id in set(get_pairs("blacklist", owner.id)):
+        blocked = guild.get_member(blocked_id)
+        if blocked:
+            overwrites[blocked] = discord.PermissionOverwrite(view_channel=False, connect=False)
 
     try:
         channel = await guild.create_voice_channel(
@@ -407,19 +482,16 @@ async def create_room(
             category=category,
             overwrites=overwrites,
             user_limit=spec.user_limit,
-            reason=f"個室Bot: {owner} が {spec.room_type} を作成",
+            reason=f"NOIR Bot: {owner} が {spec.room_type} を作成",
         )
     except discord.Forbidden:
         await interaction.followup.send(
-            "部屋を作れませんでした。Botに「チャンネル管理」「権限管理」「メンバーを移動」の権限を付けてください。",
+            "Botにチャンネル管理・権限管理・メンバー移動の権限を付けてください。",
             ephemeral=True,
         )
         return None
     except discord.HTTPException as exc:
-        await interaction.followup.send(
-            f"Discord APIエラーで作成できませんでした: `{exc}`",
-            ephemeral=True,
-        )
+        await interaction.followup.send(f"作成失敗: `{exc}`", ephemeral=True)
         return None
 
     save_room(
@@ -430,383 +502,230 @@ async def create_room(
         spec.hidden_when_two,
         spec.timed,
     )
-
-    if status:
-        await safe_set_voice_status(channel, status)
-
-    await interaction.followup.send(
-        f"✅ {channel.mention} を作成しました。",
-        ephemeral=True,
-    )
+    await interaction.followup.send(f"✅ {channel.mention} を作成しました。", ephemeral=True)
     return channel
 
 
 # =========================================================
-# 選択UI
+# VCパネル
 # =========================================================
 
-class QuickOptionSelect(discord.ui.Select):
-    def __init__(self, room_kind: str):
-        self.room_kind = room_kind
-        options: list[discord.SelectOption]
-
-        if room_kind == "public_mylist":
-            options = [
-                discord.SelectOption(label="通常部屋", value="normal", emoji="🌱"),
-            ]
-        elif room_kind == "private_mylist":
-            options = [
-                discord.SelectOption(label="通常部屋", value="normal", emoji="📚"),
-                discord.SelectOption(label="ノック部屋", value="knock", emoji="🚪"),
-                discord.SelectOption(label="添い寝部屋", value="sleep", emoji="💤"),
-                discord.SelectOption(label="ノック添い寝部屋", value="knock_sleep", emoji="🌙"),
-            ]
-        elif room_kind == "public_qm":
-            options = [
-                discord.SelectOption(label="新規開拓", value="new", emoji="🌱"),
-                discord.SelectOption(label="作業", value="work", emoji="🛠️"),
-                discord.SelectOption(label="ゲーム", value="game", emoji="🎮"),
-            ]
-        elif room_kind == "sleep":
-            options = [
-                discord.SelectOption(label="通常・同性OK", value="normal_ok", emoji="💤"),
-                discord.SelectOption(label="通常・同性NG", value="normal_ng", emoji="🌙"),
-                discord.SelectOption(label="ノック・同性OK", value="knock_ok", emoji="🚪"),
-                discord.SelectOption(label="ノック・同性NG", value="knock_ng", emoji="🔒"),
-            ]
-        elif room_kind == "eroip":
-            options = [
-                discord.SelectOption(label="待機（ノックなし）", value="normal", emoji="🔞"),
-                discord.SelectOption(label="ノックあり", value="knock", emoji="🚪"),
-            ]
-        elif room_kind == "private_qm":
-            options = [
-                discord.SelectOption(label="同性OK・ノックなし", value="ok_normal", emoji="🌙"),
-                discord.SelectOption(label="同性NG・ノックなし", value="ng_normal", emoji="🌙"),
-                discord.SelectOption(label="同性OK・ノックあり", value="ok_knock", emoji="🚪"),
-                discord.SelectOption(label="同性NG・ノックあり", value="ng_knock", emoji="🔒"),
-            ]
-        else:
-            options = [discord.SelectOption(label="通常", value="normal")]
-
+class QuickChoiceSelect(discord.ui.Select):
+    def __init__(self, kind: str):
+        self.kind = kind
+        choices = {
+            "public_mylist": [("通常部屋", "normal", "🌱")],
+            "private_mylist": [
+                ("通常部屋", "normal", "📚"),
+                ("ノック部屋", "knock", "🚪"),
+                ("添い寝部屋", "sleep", "💤"),
+                ("ノック添い寝部屋", "knock_sleep", "🌙"),
+            ],
+            "public_qm": [
+                ("新規開拓", "new", "🌱"),
+                ("作業", "work", "🛠️"),
+                ("ゲーム", "game", "🎮"),
+            ],
+            "sleep": [
+                ("通常・同性OK", "normal_ok", "💤"),
+                ("通常・同性NG", "normal_ng", "🌙"),
+                ("ノック・同性OK", "knock_ok", "🚪"),
+                ("ノック・同性NG", "knock_ng", "🔒"),
+            ],
+            "eroip": [
+                ("待機（ノックなし）", "normal", "🔞"),
+                ("ノックあり", "knock", "🚪"),
+            ],
+            "private_qm": [
+                ("同性OK・ノックなし", "ok_normal", "🌙"),
+                ("同性NG・ノックなし", "ng_normal", "🌙"),
+                ("同性OK・ノックあり", "ok_knock", "🚪"),
+                ("同性NG・ノックあり", "ng_knock", "🔒"),
+            ],
+        }
+        options = [
+            discord.SelectOption(label=label, value=value, emoji=emoji)
+            for label, value, emoji in choices[kind]
+        ]
         super().__init__(
             placeholder="部屋タイプを選択してください",
             options=options,
-            min_values=1,
-            max_values=1,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
-        value = self.values[0]
         member = interaction.user
         if not isinstance(member, discord.Member):
             return
+        value = self.values[0]
+        name = member.display_name
 
-        owner_name = member.display_name
-
-        if self.room_kind == "public_mylist":
-            favorite_ids = get_favorites(member.id)
-            favorites = [
+        if self.kind in {"public_mylist", "private_mylist"}:
+            members = [
                 interaction.guild.get_member(uid)
-                for uid in favorite_ids
+                for uid in get_pairs("favorites", member.id)
                 if interaction.guild and interaction.guild.get_member(uid)
             ]
-            favorites = [
-                m for m in favorites
-                if m and not is_blocked_either_way(member.id, m.id)
-            ]
-            if not favorites:
+            members = [m for m in members if m and not is_blocked_either_way(member.id, m.id)]
+            if not members:
                 await interaction.followup.send(
-                    "マイリストに登録済みのメンバーがいません。",
+                    "マイリストに招待可能なメンバーがいません。",
                     ephemeral=True,
                 )
                 return
-            spec = RoomSpec(
-                name=f"🌱｜{owner_name}の表マイリスト",
-                category_id=QUICK_PUBLIC_CATEGORY_ID,
-                room_type="public_mylist",
-                public_view=False,
-            )
-            await create_room(interaction, spec, allowed_members=favorites)
-            return
-
-        if self.room_kind == "private_mylist":
-            favorite_ids = get_favorites(member.id)
-            favorites = [
-                interaction.guild.get_member(uid)
-                for uid in favorite_ids
-                if interaction.guild and interaction.guild.get_member(uid)
-            ]
-            favorites = [
-                m for m in favorites
-                if m and not is_blocked_either_way(member.id, m.id)
-            ]
-            if not favorites:
-                await interaction.followup.send(
-                    "マイリストに登録済みのメンバーがいません。",
-                    ephemeral=True,
-                )
-                return
-            labels = {
-                "normal": "通常",
-                "knock": "ノック",
-                "sleep": "添い寝",
-                "knock_sleep": "ノック添い寝",
-            }
-            spec = RoomSpec(
-                name=f"📚｜{labels[value]}｜{owner_name}",
-                category_id=QUICK_PRIVATE_CATEGORY_ID,
-                room_type=f"private_mylist_{value}",
-                public_view=False,
-                hidden_when_two=True,
-                knock="knock" in value,
-            )
-            await create_room(interaction, spec, allowed_members=favorites)
-            return
-
-        if self.room_kind == "public_qm":
-            names = {
-                "new": "🌱｜新規開拓",
-                "work": "🛠️｜作業",
-                "game": "🎮｜ゲーム",
-            }
-            statuses = {
-                "new": "新規開拓・誰でもどうぞ",
-                "work": "作業内容をチャンネルステータスに入力してください",
-                "game": "ゲームタイトルをチャンネルステータスに入力してください",
-            }
-            spec = RoomSpec(
-                name=f"{names[value]}｜{owner_name}",
-                category_id=QUICK_PUBLIC_CATEGORY_ID,
-                room_type=f"public_qm_{value}",
-                public_view=True,
-            )
-            await create_room(interaction, spec, status=statuses[value])
-            return
-
-        if self.room_kind == "sleep":
-            knock = value.startswith("knock")
-            same_ok = value.endswith("_ok")
-            spec = RoomSpec(
-                name=f"💤｜{'ノック' if knock else '通常'}・{'同性OK' if same_ok else '同性NG'}｜{owner_name}",
-                category_id=QUICK_PRIVATE_CATEGORY_ID,
-                room_type=f"sleep_{value}",
-                public_view=True,
-                hidden_when_two=True,
-                knock=knock,
-            )
+            hidden = self.kind == "private_mylist"
             await create_room(
                 interaction,
-                spec,
-                status="声かけ⭕️ または 声かけ❌ を入力してください",
+                RoomSpec(
+                    name=f"{'📚' if hidden else '🌱'}｜{name}のマイリスト",
+                    category_id=QUICK_PRIVATE_CATEGORY_ID if hidden else QUICK_PUBLIC_CATEGORY_ID,
+                    room_type=f"{self.kind}_{value}",
+                    public_view=False,
+                    hidden_when_two=hidden,
+                ),
+                allowed_members=members,
             )
             return
 
-        if self.room_kind == "eroip":
-            knock = value == "knock"
-            spec = RoomSpec(
-                name=f"🔞｜{'ノック' if knock else '待機'}｜{owner_name}",
-                category_id=QUICK_PRIVATE_CATEGORY_ID,
-                room_type=f"eroip_{value}",
-                public_view=True,
-                hidden_when_two=True,
-                knock=knock,
+        if self.kind == "public_qm":
+            labels = {"new": "新規開拓", "work": "作業", "game": "ゲーム"}
+            await create_room(
+                interaction,
+                RoomSpec(
+                    name=f"🌱｜{labels[value]}｜{name}",
+                    category_id=QUICK_PUBLIC_CATEGORY_ID,
+                    room_type=f"public_qm_{value}",
+                    public_view=True,
+                ),
             )
-            await create_room(interaction, spec)
             return
 
-        if self.room_kind == "private_qm":
-            knock = value.endswith("knock")
+        if self.kind == "sleep":
+            knock = value.startswith("knock")
+            same_ok = value.endswith("_ok")
+            await create_room(
+                interaction,
+                RoomSpec(
+                    name=f"💤｜{'ノック' if knock else '通常'}・{'同性OK' if same_ok else '同性NG'}｜{name}",
+                    category_id=QUICK_PRIVATE_CATEGORY_ID,
+                    room_type=f"sleep_{value}",
+                    public_view=True,
+                    hidden_when_two=True,
+                    opposite_gender_only=not same_ok,
+                ),
+            )
+            return
+
+        if self.kind == "eroip":
+            await create_room(
+                interaction,
+                RoomSpec(
+                    name=f"🔞｜{'ノック' if value == 'knock' else '待機'}｜{name}",
+                    category_id=QUICK_PRIVATE_CATEGORY_ID,
+                    room_type=f"eroip_{value}",
+                    public_view=True,
+                    hidden_when_two=True,
+                ),
+            )
+            return
+
+        if self.kind == "private_qm":
             same_ok = value.startswith("ok")
-            spec = RoomSpec(
-                name=f"🌙｜{'同性OK' if same_ok else '同性NG'}・{'ノック' if knock else '通常'}｜{owner_name}",
-                category_id=QUICK_PRIVATE_CATEGORY_ID,
-                room_type=f"private_qm_{value}",
-                public_view=False,
-                hidden_when_two=True,
-                opposite_gender_only=not same_ok,
-                knock=knock,
+            await create_room(
+                interaction,
+                RoomSpec(
+                    name=f"🌙｜{'同性OK' if same_ok else '同性NG'}｜{name}",
+                    category_id=QUICK_PRIVATE_CATEGORY_ID,
+                    room_type=f"private_qm_{value}",
+                    public_view=False,
+                    hidden_when_two=True,
+                    opposite_gender_only=not same_ok,
+                ),
             )
-            await create_room(interaction, spec)
-            return
 
 
-class QuickOptionView(discord.ui.View):
-    def __init__(self, room_kind: str):
+class QuickChoiceView(discord.ui.View):
+    def __init__(self, kind: str):
         super().__init__(timeout=120)
-        self.add_item(QuickOptionSelect(room_kind))
+        self.add_item(QuickChoiceSelect(kind))
 
 
 class QuickPanel(discord.ui.View):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(timeout=None)
 
-    @discord.ui.button(
-        label="表マイリスト部屋",
-        emoji="🌱",
-        style=discord.ButtonStyle.success,
-        custom_id="room:quick:public_mylist",
-        row=0,
-    )
-    async def public_mylist(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
+    async def open_select(self, interaction: discord.Interaction, kind: str, text: str) -> None:
         await interaction.response.send_message(
-            "作成タイプを選択してください。",
-            view=QuickOptionView("public_mylist"),
+            text,
+            view=QuickChoiceView(kind),
             ephemeral=True,
         )
 
-    @discord.ui.button(
-        label="裏マイリスト部屋",
-        emoji="📚",
-        style=discord.ButtonStyle.primary,
-        custom_id="room:quick:private_mylist",
-        row=0,
-    )
-    async def private_mylist(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        await interaction.response.send_message(
-            "作成タイプを選択してください。",
-            view=QuickOptionView("private_mylist"),
-            ephemeral=True,
-        )
+    @discord.ui.button(label="表マイリスト部屋", emoji="🌱", style=discord.ButtonStyle.success, custom_id="noir:quick:public_mylist", row=0)
+    async def public_mylist(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.open_select(interaction, "public_mylist", "作成タイプを選択してください。")
 
-    @discord.ui.button(
-        label="表QM部屋",
-        emoji="🌱",
-        style=discord.ButtonStyle.success,
-        custom_id="room:quick:public_qm",
-        row=1,
-    )
-    async def public_qm(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        await interaction.response.send_message(
-            "作成タイプを選択してください。",
-            view=QuickOptionView("public_qm"),
-            ephemeral=True,
-        )
+    @discord.ui.button(label="裏マイリスト部屋", emoji="📚", style=discord.ButtonStyle.primary, custom_id="noir:quick:private_mylist", row=0)
+    async def private_mylist(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.open_select(interaction, "private_mylist", "作成タイプを選択してください。")
 
-    @discord.ui.button(
-        label="表時間制部屋",
-        emoji="⏰",
-        style=discord.ButtonStyle.secondary,
-        custom_id="room:quick:public_timed",
-        row=1,
-    )
-    async def public_timed(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
+    @discord.ui.button(label="表QM部屋", emoji="🌱", style=discord.ButtonStyle.success, custom_id="noir:quick:public_qm", row=1)
+    async def public_qm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.open_select(interaction, "public_qm", "表QMのタイプを選択してください。")
+
+    @discord.ui.button(label="表時間制部屋", emoji="⏰", style=discord.ButtonStyle.secondary, custom_id="noir:quick:public_timed", row=1)
+    async def public_timed(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         member = interaction.user
         assert isinstance(member, discord.Member)
-        spec = RoomSpec(
-            name=f"⏰｜表時間制｜{member.display_name}",
-            category_id=QUICK_PUBLIC_CATEGORY_ID,
-            room_type="public_timed",
-            public_view=True,
-            timed=True,
-            user_limit=2,
+        await create_room(
+            interaction,
+            RoomSpec(
+                name=f"⏰｜表時間制｜{member.display_name}",
+                category_id=QUICK_PUBLIC_CATEGORY_ID,
+                room_type="public_timed",
+                public_view=True,
+                timed=True,
+                user_limit=2,
+            ),
         )
-        await create_room(interaction, spec)
 
-    @discord.ui.button(
-        label="裏時間制部屋",
-        emoji="⏰",
-        style=discord.ButtonStyle.secondary,
-        custom_id="room:quick:private_timed",
-        row=1,
-    )
-    async def private_timed(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
+    @discord.ui.button(label="裏時間制部屋", emoji="⏰", style=discord.ButtonStyle.secondary, custom_id="noir:quick:private_timed", row=1)
+    async def private_timed(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         member = interaction.user
         assert isinstance(member, discord.Member)
-        spec = RoomSpec(
-            name=f"⏰｜裏時間制｜{member.display_name}",
-            category_id=QUICK_PRIVATE_CATEGORY_ID,
-            room_type="private_timed",
-            public_view=True,
-            hidden_when_two=True,
-            timed=True,
-            user_limit=2,
-        )
-        await create_room(interaction, spec)
-
-    @discord.ui.button(
-        label="裏添い寝部屋",
-        emoji="💤",
-        style=discord.ButtonStyle.primary,
-        custom_id="room:quick:sleep",
-        row=2,
-    )
-    async def sleep_room(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        await interaction.response.send_message(
-            "添い寝部屋のタイプを選択してください。",
-            view=QuickOptionView("sleep"),
-            ephemeral=True,
+        await create_room(
+            interaction,
+            RoomSpec(
+                name=f"⏰｜裏時間制｜{member.display_name}",
+                category_id=QUICK_PRIVATE_CATEGORY_ID,
+                room_type="private_timed",
+                public_view=True,
+                hidden_when_two=True,
+                timed=True,
+                user_limit=2,
+            ),
         )
 
-    @discord.ui.button(
-        label="エロイプ部屋",
-        emoji="🔞",
-        style=discord.ButtonStyle.danger,
-        custom_id="room:quick:eroip",
-        row=2,
-    )
-    async def eroip_room(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        await interaction.response.send_message(
-            "部屋タイプを選択してください。",
-            view=QuickOptionView("eroip"),
-            ephemeral=True,
-        )
+    @discord.ui.button(label="裏添い寝部屋", emoji="💤", style=discord.ButtonStyle.primary, custom_id="noir:quick:sleep", row=2)
+    async def sleep(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.open_select(interaction, "sleep", "添い寝部屋のタイプを選択してください。")
 
-    @discord.ui.button(
-        label="裏QM部屋",
-        emoji="🌙",
-        style=discord.ButtonStyle.primary,
-        custom_id="room:quick:private_qm",
-        row=2,
-    )
-    async def private_qm(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        await interaction.response.send_message(
-            "裏QM部屋のタイプを選択してください。",
-            view=QuickOptionView("private_qm"),
-            ephemeral=True,
-        )
+    @discord.ui.button(label="エロイプ部屋", emoji="🔞", style=discord.ButtonStyle.danger, custom_id="noir:quick:eroip", row=2)
+    async def eroip(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.open_select(interaction, "eroip", "部屋タイプを選択してください。")
+
+    @discord.ui.button(label="裏QM部屋", emoji="🌙", style=discord.ButtonStyle.primary, custom_id="noir:quick:private_qm", row=2)
+    async def private_qm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.open_select(interaction, "private_qm", "裏QMのタイプを選択してください。")
 
 
-class PrivateRoomUserSelect(discord.ui.UserSelect):
+class PrivateUserSelect(discord.ui.UserSelect):
     def __init__(self, hidden: bool):
         self.hidden = hidden
         super().__init__(
-            placeholder="個室に招待するユーザーを選択",
+            placeholder="招待するユーザーを選択",
             min_values=1,
             max_values=10,
         )
@@ -814,226 +733,466 @@ class PrivateRoomUserSelect(discord.ui.UserSelect):
     async def callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         owner = interaction.user
-        if not isinstance(owner, discord.Member):
-            return
-
-        selected: list[discord.Member] = []
-        blocked_names: list[str] = []
-
-        for user in self.values:
-            member = interaction.guild.get_member(user.id) if interaction.guild else None
-            if not member or member.bot or member.id == owner.id:
-                continue
-            if is_blocked_either_way(owner.id, member.id):
-                blocked_names.append(member.display_name)
-                continue
-            selected.append(member)
-
-        if not selected:
-            await interaction.followup.send(
-                "招待できるユーザーが選択されていません。ブラックリスト関係の相手は招待できません。",
-                ephemeral=True,
-            )
-            return
-
-        spec = RoomSpec(
-            name=f"{'🚫' if self.hidden else '⭕'}｜{owner.display_name}の個室",
-            category_id=(
-                PRIVATE_HIDDEN_CATEGORY_ID
-                if self.hidden
-                else PRIVATE_PUBLIC_CATEGORY_ID
-            ),
-            room_type="hidden_private" if self.hidden else "public_private",
-            public_view=not self.hidden,
-        )
-        channel = await create_room(interaction, spec, allowed_members=selected)
-
-        if channel and blocked_names:
-            await interaction.followup.send(
-                "ブラックリスト関係のため除外: " + "、".join(blocked_names),
-                ephemeral=True,
-            )
-
-
-class FavoriteRoomSelect(discord.ui.Select):
-    def __init__(self, owner: discord.Member, hidden: bool):
-        self.owner_id = owner.id
-        self.hidden = hidden
-
-        favorite_ids = get_favorites(owner.id)
-        options: list[discord.SelectOption] = []
-
-        for user_id in favorite_ids[:25]:
-            member = owner.guild.get_member(user_id)
-            if not member or member.bot:
-                continue
-            if is_blocked_either_way(owner.id, member.id):
-                continue
-            options.append(
-                discord.SelectOption(
-                    label=member.display_name[:100],
-                    value=str(member.id),
-                    description=f"ID: {member.id}",
-                )
-            )
-
-        if not options:
-            options = [
-                discord.SelectOption(
-                    label="選択できるお気に入りがありません",
-                    value="none",
-                )
-            ]
-
-        super().__init__(
-            placeholder="お気に入りから選択",
-            options=options,
-            min_values=1,
-            max_values=min(10, len(options)),
-        )
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(
-                "この選択画面は作成者本人だけ使用できます。",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        if "none" in self.values:
-            await interaction.followup.send(
-                "先に `/mylist_add` でお気に入りを登録してください。",
-                ephemeral=True,
-            )
-            return
-
-        members: list[discord.Member] = []
-        if interaction.guild:
-            for value in self.values:
-                member = interaction.guild.get_member(int(value))
-                if member and not is_blocked_either_way(interaction.user.id, member.id):
-                    members.append(member)
-
-        if not members:
-            await interaction.followup.send(
-                "招待可能なメンバーがいません。",
-                ephemeral=True,
-            )
-            return
-
-        owner = interaction.user
         assert isinstance(owner, discord.Member)
 
-        spec = RoomSpec(
-            name=f"{'🚫' if self.hidden else '⭕'}｜{owner.display_name}の個室",
-            category_id=(
-                PRIVATE_HIDDEN_CATEGORY_ID
-                if self.hidden
-                else PRIVATE_PUBLIC_CATEGORY_ID
+        members = []
+        for user in self.values:
+            member = interaction.guild.get_member(user.id) if interaction.guild else None
+            if member and not member.bot and member.id != owner.id and not is_blocked_either_way(owner.id, member.id):
+                members.append(member)
+
+        if not members:
+            await interaction.followup.send("招待可能なユーザーがいません。", ephemeral=True)
+            return
+
+        await create_room(
+            interaction,
+            RoomSpec(
+                name=f"{'🚫' if self.hidden else '⭕'}｜{owner.display_name}の個室",
+                category_id=PRIVATE_HIDDEN_CATEGORY_ID if self.hidden else PRIVATE_PUBLIC_CATEGORY_ID,
+                room_type="hidden_private" if self.hidden else "public_private",
+                public_view=not self.hidden,
             ),
-            room_type="hidden_private" if self.hidden else "public_private",
-            public_view=not self.hidden,
+            allowed_members=members,
         )
-        await create_room(interaction, spec, allowed_members=members)
 
 
-class PrivateCreateChoiceView(discord.ui.View):
-    def __init__(self, owner: discord.Member, hidden: bool):
+class PrivateSelectView(discord.ui.View):
+    def __init__(self, hidden: bool):
         super().__init__(timeout=120)
-        self.owner = owner
-        self.hidden = hidden
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.owner.id:
-            await interaction.response.send_message(
-                "この画面はボタンを押した本人だけ使えます。",
-                ephemeral=True,
-            )
-            return False
-        return True
-
-    @discord.ui.button(
-        label="ユーザー選択",
-        emoji="👤",
-        style=discord.ButtonStyle.primary,
-    )
-    async def user_select(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        view = discord.ui.View(timeout=120)
-        view.add_item(PrivateRoomUserSelect(self.hidden))
-        await interaction.response.edit_message(
-            content="招待するユーザーを選択してください。",
-            view=view,
-        )
-
-    @discord.ui.button(
-        label="お気に入り選択",
-        emoji="⭐",
-        style=discord.ButtonStyle.success,
-    )
-    async def favorite_select(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        view = discord.ui.View(timeout=120)
-        view.add_item(FavoriteRoomSelect(self.owner, self.hidden))
-        await interaction.response.edit_message(
-            content="お気に入りから招待するユーザーを選択してください。",
-            view=view,
-        )
+        self.add_item(PrivateUserSelect(hidden))
 
 
 class PrivatePanel(discord.ui.View):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(timeout=None)
 
-    @discord.ui.button(
-        label="表個室",
-        emoji="⭕",
-        style=discord.ButtonStyle.success,
-        custom_id="room:private:public",
-    )
-    async def public_private(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        owner = interaction.user
-        if not isinstance(owner, discord.Member):
-            return
+    @discord.ui.button(label="表個室", emoji="⭕", style=discord.ButtonStyle.success, custom_id="noir:private:public")
+    async def public_private(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_message(
-            "作成方法を選択してください。\n"
-            "表個室は全員が閲覧できますが、接続できるのは作成者と選択した人だけです。",
-            view=PrivateCreateChoiceView(owner, hidden=False),
+            "招待するユーザーを選択してください。",
+            view=PrivateSelectView(False),
             ephemeral=True,
         )
 
-    @discord.ui.button(
-        label="裏個室",
-        emoji="🚫",
-        style=discord.ButtonStyle.danger,
-        custom_id="room:private:hidden",
-    )
-    async def hidden_private(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        owner = interaction.user
-        if not isinstance(owner, discord.Member):
-            return
+    @discord.ui.button(label="裏個室", emoji="🚫", style=discord.ButtonStyle.danger, custom_id="noir:private:hidden")
+    async def hidden_private(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_message(
-            "作成方法を選択してください。\n"
-            "裏個室は作成者と選択した人だけが閲覧・接続できます。",
-            view=PrivateCreateChoiceView(owner, hidden=True),
+            "招待するユーザーを選択してください。",
+            view=PrivateSelectView(True),
             ephemeral=True,
         )
+
+
+# =========================================================
+# なう募集
+# =========================================================
+
+class NowRecruitModal(discord.ui.Modal):
+    def __init__(self, target_type: str):
+        super().__init__(title="なう募集を作成")
+        self.target_type = target_type
+        self.comment = discord.ui.TextInput(
+            label="一言",
+            placeholder="例：誰か話そう！",
+            default="誰か話そう！",
+            max_length=200,
+            style=discord.TextStyle.paragraph,
+        )
+        self.add_item(self.comment)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            await interaction.response.send_message("サーバー内で使用してください。", ephemeral=True)
+            return
+
+        channel = get_text_channel(guild, NOW_RECRUIT_CHANNEL_ID)
+        if channel is None:
+            await interaction.response.send_message("なう募集チャンネルが見つかりません。", ephemeral=True)
+            return
+
+        mention, label = target_role_and_label(guild, self.target_type)
+        profile_channel = profile_channel_for(member)
+        profile_text = profile_channel.mention if profile_channel else "プロフィールチャンネル未設定"
+
+        embed = discord.Embed(
+            title=f"なう募集 - {label}",
+            description=str(self.comment.value),
+            color=discord.Color.from_rgb(255, 120, 180),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(name="ユーザー", value=f"{member.mention}\n`@{member.display_name}`", inline=False)
+        embed.add_field(name="プロフィール", value=profile_text, inline=False)
+        embed.add_field(name="一言", value=str(self.comment.value), inline=False)
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.set_footer(text="💞 立候補ボタンから応募できます")
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        message = await channel.send(
+            content=mention or None,
+            embed=embed,
+            view=RecruitActionView(),
+            allowed_mentions=discord.AllowedMentions(roles=True, users=True),
+        )
+        save_now_recruitment(message.id, member.id, self.target_type, str(self.comment.value))
+        await interaction.followup.send(
+            f"✅ {message.jump_url} に募集を投稿しました。",
+            ephemeral=True,
+        )
+
+
+class NowPanel(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="男性宛", emoji="💎", style=discord.ButtonStyle.primary, custom_id="noir:now:male")
+    async def male(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(NowRecruitModal("male"))
+
+    @discord.ui.button(label="女性宛", emoji="💗", style=discord.ButtonStyle.danger, custom_id="noir:now:female")
+    async def female(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(NowRecruitModal("female"))
+
+    @discord.ui.button(label="全員宛", emoji="🐣", style=discord.ButtonStyle.success, custom_id="noir:now:all")
+    async def all_members(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(NowRecruitModal("all"))
+
+
+# =========================================================
+# 裏募集
+# =========================================================
+
+class FilterRecruitModal(discord.ui.Modal):
+    def __init__(self, mode: str):
+        super().__init__(title="裏募集を作成")
+        self.mode = mode
+
+        self.recruit_title = discord.ui.TextInput(
+            label="募集タイトル",
+            placeholder="例：今夜ゆっくり話せる人",
+            max_length=100,
+        )
+        self.body = discord.ui.TextInput(
+            label="募集内容",
+            placeholder="募集内容を入力してください",
+            max_length=1000,
+            style=discord.TextStyle.paragraph,
+        )
+        self.conditions = discord.ui.TextInput(
+            label="希望条件",
+            placeholder="例：25歳以上／落ち着いた声／同性OK",
+            max_length=500,
+            style=discord.TextStyle.paragraph,
+            required=False,
+        )
+        self.mylist = discord.ui.TextInput(
+            label="マイリスト限定",
+            placeholder="限定する場合は「はい」、しない場合は空欄",
+            max_length=10,
+            required=False,
+        )
+        self.add_item(self.recruit_title)
+        self.add_item(self.body)
+        self.add_item(self.conditions)
+        self.add_item(self.mylist)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        owner = interaction.user
+        if guild is None or not isinstance(owner, discord.Member):
+            await interaction.response.send_message("サーバー内で使用してください。", ephemeral=True)
+            return
+
+        channel = get_text_channel(guild, RECRUIT_NOTIFICATION_CHANNEL_ID)
+        if channel is None:
+            await interaction.response.send_message("募集通知チャンネルが見つかりません。", ephemeral=True)
+            return
+
+        role_id = ANONYMOUS_NOTIFY_ROLE_ID if self.mode == "anonymous" else NAMED_NOTIFY_ROLE_ID
+        role = guild.get_role(role_id)
+        mylist_only = str(self.mylist.value).strip() in {"はい", "yes", "YES", "1"}
+
+        embed = discord.Embed(
+            title=f"{'匿名' if self.mode == 'anonymous' else '記名'}募集｜{self.recruit_title.value}",
+            description=str(self.body.value),
+            color=discord.Color.dark_purple(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(
+            name="希望条件",
+            value=str(self.conditions.value).strip() or "特になし",
+            inline=False,
+        )
+        embed.add_field(
+            name="公開範囲",
+            value="マイリスト限定" if mylist_only else "募集対象者全体",
+            inline=False,
+        )
+
+        if self.mode == "named":
+            embed.add_field(name="募集主", value=owner.mention, inline=False)
+            embed.set_thumbnail(url=owner.display_avatar.url)
+        else:
+            embed.set_footer(text="募集主は応募承認後に表示されます")
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        message = await channel.send(
+            content=role.mention if role else None,
+            embed=embed,
+            view=RecruitActionView(),
+            allowed_mentions=discord.AllowedMentions(roles=True),
+        )
+        save_recruitment(
+            message.id,
+            owner.id,
+            self.mode,
+            str(self.recruit_title.value),
+            str(self.body.value),
+            str(self.conditions.value),
+            mylist_only,
+        )
+        await send_log(guild, f"📝 裏募集作成：{owner.mention} / message={message.id} / mode={self.mode}")
+        await interaction.followup.send(
+            f"✅ {message.jump_url} に裏募集を投稿しました。",
+            ephemeral=True,
+        )
+
+
+class FilterRecruitPanel(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="匿名で募集", emoji="🎭", style=discord.ButtonStyle.secondary, custom_id="noir:filter:anonymous")
+    async def anonymous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(FilterRecruitModal("anonymous"))
+
+    @discord.ui.button(label="記名で募集", emoji="🪪", style=discord.ButtonStyle.primary, custom_id="noir:filter:named")
+    async def named(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(FilterRecruitModal("named"))
+
+
+# =========================================================
+# 募集応募・取消
+# =========================================================
+
+class ApplicationDecisionView(discord.ui.View):
+    def __init__(self, application_id: int):
+        super().__init__(timeout=None)
+        self.application_id = application_id
+
+        approve = discord.ui.Button(
+            label="承認",
+            emoji="✅",
+            style=discord.ButtonStyle.success,
+            custom_id=f"noir:application:approve:{application_id}",
+        )
+        reject = discord.ui.Button(
+            label="お断り",
+            emoji="❌",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"noir:application:reject:{application_id}",
+        )
+        approve.callback = self.approve
+        reject.callback = self.reject
+        self.add_item(approve)
+        self.add_item(reject)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        row = get_application(self.application_id)
+        if row is None:
+            await interaction.response.send_message("応募情報が見つかりません。", ephemeral=True)
+            return False
+        if interaction.user.id != int(row["owner_id"]):
+            await interaction.response.send_message("募集主だけ操作できます。", ephemeral=True)
+            return False
+        return True
+
+    async def approve(self, interaction: discord.Interaction) -> None:
+        row = get_application(self.application_id)
+        if row is None or row["status"] != "pending":
+            await interaction.response.send_message("この応募は処理済みです。", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        if guild is None:
+            return
+
+        owner = guild.get_member(int(row["owner_id"]))
+        applicant = guild.get_member(int(row["applicant_id"]))
+        if owner is None or applicant is None:
+            await interaction.response.send_message("ユーザーが見つかりません。", ephemeral=True)
+            return
+
+        update_application(self.application_id, "approved")
+
+        parent = get_text_channel(guild, RECRUIT_NOTIFICATION_CHANNEL_ID)
+        thread_text = ""
+        if parent:
+            try:
+                thread = await parent.create_thread(
+                    name=clean_channel_name(f"連絡用｜{owner.display_name}×{applicant.display_name}"),
+                    type=discord.ChannelType.private_thread,
+                    reason="募集応募が承認されたため",
+                )
+                await thread.add_user(owner)
+                await thread.add_user(applicant)
+                await thread.send(
+                    f"{owner.mention} {applicant.mention}\n"
+                    "応募が承認されました。このスレッドで連絡してください。"
+                )
+                thread_text = f"\n連絡用スレッド：{thread.mention}"
+            except Exception:
+                log.exception("連絡用スレッド作成失敗")
+
+        try:
+            await applicant.send(f"✅ {guild.name} の募集への応募が承認されました。{thread_text}")
+        except discord.HTTPException:
+            pass
+
+        await send_log(guild, f"✅ 応募承認：募集主 {owner.mention} / 応募者 {applicant.mention}")
+        await interaction.response.edit_message(
+            content=(interaction.message.content or "") + f"\n\n✅ 承認済み：{applicant.mention}{thread_text}",
+            view=None,
+        )
+
+    async def reject(self, interaction: discord.Interaction) -> None:
+        row = get_application(self.application_id)
+        if row is None or row["status"] != "pending":
+            await interaction.response.send_message("この応募は処理済みです。", ephemeral=True)
+            return
+
+        update_application(self.application_id, "rejected")
+        guild = interaction.guild
+        if guild:
+            applicant = guild.get_member(int(row["applicant_id"]))
+            if applicant:
+                try:
+                    await applicant.send(f"今回は募集への応募が見送られました。")
+                except discord.HTTPException:
+                    pass
+            await send_log(guild, f"❌ 応募却下：application={self.application_id}")
+
+        await interaction.response.edit_message(
+            content=(interaction.message.content or "") + "\n\n❌ お断り済み",
+            view=None,
+        )
+
+
+class RecruitActionView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="立候補", emoji="💞", style=discord.ButtonStyle.success, custom_id="noir:recruit:apply")
+    async def apply(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.message is None or interaction.guild is None:
+            return
+
+        now_row = get_now_recruitment(interaction.message.id)
+        recruit_row = get_recruitment(interaction.message.id)
+        row = now_row or recruit_row
+
+        if row is None or not bool(row["active"]):
+            await interaction.response.send_message("この募集は終了しています。", ephemeral=True)
+            return
+
+        owner_id = int(row["owner_id"])
+        if interaction.user.id == owner_id:
+            await interaction.response.send_message("自分の募集には立候補できません。", ephemeral=True)
+            return
+
+        if is_blocked_either_way(owner_id, interaction.user.id):
+            await interaction.response.send_message(
+                "ブラックリスト関係のため応募できません。",
+                ephemeral=True,
+            )
+            return
+
+        if recruit_row is not None and bool(recruit_row["mylist_only"]):
+            if interaction.user.id not in get_pairs("favorites", owner_id):
+                await interaction.response.send_message(
+                    "この募集は募集主のマイリスト限定です。",
+                    ephemeral=True,
+                )
+                return
+
+        application_id = create_application(
+            interaction.message.id,
+            owner_id,
+            interaction.user.id,
+        )
+        owner = interaction.guild.get_member(owner_id)
+        confirm = get_text_channel(interaction.guild, RECRUIT_CONFIRM_CHANNEL_ID)
+
+        embed = discord.Embed(
+            title="💞 募集への立候補",
+            description=f"{interaction.user.mention} さんから立候補が届きました。",
+            color=discord.Color.pink(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(name="元の募集", value=interaction.message.jump_url, inline=False)
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+
+        if confirm:
+            await confirm.send(
+                content=owner.mention if owner else None,
+                embed=embed,
+                view=ApplicationDecisionView(application_id),
+                allowed_mentions=discord.AllowedMentions(users=True),
+            )
+
+        if owner:
+            try:
+                await owner.send(
+                    f"💞 {interaction.guild.name} で立候補が届きました。\n"
+                    f"応募者：{interaction.user} ({interaction.user.id})\n"
+                    f"募集：{interaction.message.jump_url}"
+                )
+            except discord.HTTPException:
+                pass
+
+        await send_log(
+            interaction.guild,
+            f"💞 立候補：募集主 <@{owner_id}> / 応募者 {interaction.user.mention}",
+        )
+        await interaction.response.send_message(
+            "✅ 立候補を送信しました。募集主の確認をお待ちください。",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="取消", emoji="🗑️", style=discord.ButtonStyle.danger, custom_id="noir:recruit:cancel")
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.message is None:
+            return
+
+        now_row = get_now_recruitment(interaction.message.id)
+        recruit_row = get_recruitment(interaction.message.id)
+        row = now_row or recruit_row
+
+        if row is None:
+            await interaction.response.send_message("募集情報が見つかりません。", ephemeral=True)
+            return
+
+        member = interaction.user
+        allowed = interaction.user.id == int(row["owner_id"]) or (
+            isinstance(member, discord.Member) and is_bot_admin(member)
+        )
+        if not allowed:
+            await interaction.response.send_message("募集主または管理者だけ取消できます。", ephemeral=True)
+            return
+
+        if now_row:
+            close_now_recruitment(interaction.message.id)
+        else:
+            close_recruitment(interaction.message.id)
+
+        embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed()
+        embed.color = discord.Color.dark_grey()
+        embed.set_footer(text="この募集は終了しました")
+        await interaction.response.edit_message(embed=embed, view=None)
+        if interaction.guild:
+            await send_log(interaction.guild, f"🗑️ 募集取消：message={interaction.message.id}")
 
 
 # =========================================================
@@ -1046,7 +1205,7 @@ intents.members = True
 intents.voice_states = True
 
 
-class RoomBot(commands.Bot):
+class NoirBot(commands.Bot):
     def __init__(self) -> None:
         super().__init__(
             command_prefix="!",
@@ -1059,47 +1218,26 @@ class RoomBot(commands.Bot):
     async def setup_hook(self) -> None:
         init_db()
 
-        # 再起動後もパネルボタンを使えるようにする
         self.add_view(QuickPanel())
         self.add_view(PrivatePanel())
+        self.add_view(NowPanel())
+        self.add_view(FilterRecruitPanel())
+        self.add_view(RecruitActionView())
 
         guild_obj = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild_obj)
 
-        try:
-            synced = await self.tree.sync(guild=guild_obj)
-            log.info(
-                "%s個のコマンドをGuild %sへ同期しました",
-                len(synced),
-                GUILD_ID,
-            )
-        except discord.Forbidden:
-            log.exception(
-                "Guildコマンド同期に失敗しました。"
-                "RenderのDISCORD_TOKENが、このサーバーに参加しているBotのものか確認してください。"
-                "またBotを bot + applications.commands の両方のScopeで招待してください。"
-            )
-        except discord.HTTPException:
-            log.exception("Discord APIエラーによりコマンド同期に失敗しました。")
+        synced = await self.tree.sync(guild=guild_obj)
+        log.info("Synced %s guild commands", len(synced))
 
     async def on_ready(self) -> None:
-        log.info("ログインBot: %s", self.user)
-        log.info("BotユーザーID: %s", self.user.id if self.user else "?")
-        log.info("設定Guild ID: %s", GUILD_ID)
-
+        log.info("Logged in: %s (%s)", self.user, self.user.id if self.user else "?")
         guild = self.get_guild(GUILD_ID)
-        if guild is None:
-            log.error(
-                "設定したGuildが見つかりません。"
-                "このトークンのBotがGuild %sへ参加しているか確認してください。",
-                GUILD_ID,
-            )
+        if guild:
+            log.info("Guild: %s (%s)", guild.name, guild.id)
         else:
-            log.info("接続Guild: %s (%s)", guild.name, guild.id)
+            log.error("Guild %s が見つかりません", GUILD_ID)
 
-        await self.cleanup_missing_rooms()
-
-    async def cleanup_missing_rooms(self) -> None:
         for row in all_rooms():
             guild = self.get_guild(int(row["guild_id"]))
             channel = guild.get_channel(int(row["channel_id"])) if guild else None
@@ -1123,7 +1261,7 @@ class RoomBot(commands.Bot):
             except discord.NotFound:
                 pass
             except Exception:
-                log.exception("時間制部屋の削除失敗: %s", channel.id)
+                log.exception("時間制部屋削除失敗")
             finally:
                 delete_room_record(channel.id)
                 self.timer_tasks.pop(channel.id, None)
@@ -1140,37 +1278,30 @@ class RoomBot(commands.Bot):
                 await asyncio.sleep(EMPTY_DELETE_SECONDS)
                 current = channel.guild.get_channel(channel.id)
                 if isinstance(current, discord.VoiceChannel) and not current.members:
-                    await current.delete(reason="作成部屋が空室になったため削除")
+                    await current.delete(reason="空室になったため削除")
                     delete_room_record(channel.id)
             except asyncio.CancelledError:
                 raise
             except discord.NotFound:
                 delete_room_record(channel.id)
             except Exception:
-                log.exception("空室削除失敗: %s", channel.id)
+                log.exception("空室削除失敗")
             finally:
                 self.empty_tasks.pop(channel.id, None)
 
         self.empty_tasks[channel.id] = asyncio.create_task(runner())
 
-    async def hide_room_for_current_members(
-        self,
-        channel: discord.VoiceChannel,
-        owner_id: int,
-    ) -> None:
-        # @everyoneから見えなくし、現在VCにいる人と作成者だけ見えるようにする
+    async def hide_room(self, channel: discord.VoiceChannel, owner_id: int) -> None:
         await channel.set_permissions(
             channel.guild.default_role,
             view_channel=False,
             connect=False,
-            reason="2人揃ったため部屋を非表示",
+            reason="2人揃ったため非表示",
         )
-
         owner = channel.guild.get_member(owner_id)
         allowed = list(channel.members)
         if owner and owner not in allowed:
             allowed.append(owner)
-
         for member in allowed:
             await channel.set_permissions(
                 member,
@@ -1179,7 +1310,6 @@ class RoomBot(commands.Bot):
                 speak=True,
                 stream=True,
                 use_voice_activation=True,
-                reason="個室参加者の閲覧・接続を維持",
             )
 
     async def on_voice_state_update(
@@ -1188,13 +1318,13 @@ class RoomBot(commands.Bot):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
-        affected_ids = {
-            channel.id
-            for channel in (before.channel, after.channel)
-            if isinstance(channel, discord.VoiceChannel)
+        ids = {
+            ch.id
+            for ch in (before.channel, after.channel)
+            if isinstance(ch, discord.VoiceChannel)
         }
 
-        for channel_id in affected_ids:
+        for channel_id in ids:
             row = get_room(channel_id)
             if row is None:
                 continue
@@ -1206,7 +1336,6 @@ class RoomBot(commands.Bot):
 
             real_members = [m for m in channel.members if not m.bot]
 
-            # 人が戻ったら空室削除を中止
             if real_members:
                 task = self.empty_tasks.pop(channel.id, None)
                 if task:
@@ -1217,270 +1346,231 @@ class RoomBot(commands.Bot):
 
             if bool(row["hidden_when_two"]) and len(real_members) >= 2:
                 try:
-                    await self.hide_room_for_current_members(
-                        channel,
-                        int(row["owner_id"]),
-                    )
-                except discord.Forbidden:
-                    log.error("非表示化に必要な権限がありません: %s", channel.id)
+                    await self.hide_room(channel, int(row["owner_id"]))
                 except Exception:
-                    log.exception("部屋の非表示化失敗: %s", channel.id)
+                    log.exception("部屋非表示化失敗")
 
             if bool(row["timed"]) and len(real_members) >= 2:
                 await self.start_room_timer(channel)
 
 
-bot = RoomBot()
+bot = NoirBot()
 
 
 # =========================================================
 # スラッシュコマンド
 # =========================================================
 
-@bot.tree.command(name="setup_quick_panel", description="クイック作成パネルを設置します")
+def admin_only(interaction: discord.Interaction) -> bool:
+    return isinstance(interaction.user, discord.Member) and is_bot_admin(interaction.user)
+
+
+@bot.tree.command(name="setup_quick_panel", description="クイック作成パネルを設置")
 @app_commands.guild_only()
 async def setup_quick_panel(interaction: discord.Interaction) -> None:
-    member = interaction.user
-    if not isinstance(member, discord.Member) or not is_bot_admin(member):
-        await interaction.response.send_message(
-            "管理者専用コマンドです。",
-            ephemeral=True,
-        )
+    if not admin_only(interaction):
+        await interaction.response.send_message("管理者専用です。", ephemeral=True)
         return
 
     embed = discord.Embed(
         title="➕ クイック作成",
         description=(
             "作成したい部屋のボタンを押してください。\n\n"
-            "🌱 **表マイリスト部屋**\n"
-            "マイリスト登録者だけが閲覧・接続できます。\n\n"
-            "📚 **裏マイリスト部屋**\n"
-            "マイリスト登録者向け。2人揃うと外から見えなくなります。\n\n"
-            "🌱 **表QM部屋**\n"
-            "新規開拓・作業・ゲームから選択できます。\n\n"
-            "⏰ **表／裏時間制部屋**\n"
-            "2人揃ってから10分で自動削除されます。\n\n"
-            "💤 **裏添い寝部屋**\n"
-            "通常／ノック、同性OK／NGを選択できます。\n\n"
-            "🔞 **エロイプ部屋**\n"
-            "待機またはノックから選択できます。\n\n"
-            "🌙 **裏QM部屋**\n"
-            "同性OK／NG、ノックあり／なしを選択できます。\n\n"
-            "※ブラックリスト関係のユーザーには閲覧・接続権限を付与しません。"
+            "🌱 表マイリスト部屋\n"
+            "📚 裏マイリスト部屋\n"
+            "🌱 表QM部屋\n"
+            "⏰ 表／裏時間制部屋\n"
+            "💤 裏添い寝部屋\n"
+            "🔞 エロイプ部屋\n"
+            "🌙 裏QM部屋"
         ),
         color=discord.Color.blurple(),
     )
     await interaction.channel.send(embed=embed, view=QuickPanel())
-    await interaction.response.send_message(
-        "✅ クイック作成パネルを設置しました。",
-        ephemeral=True,
-    )
+    await interaction.response.send_message("✅ 設置しました。", ephemeral=True)
 
 
-@bot.tree.command(name="setup_private_panel", description="表個室・裏個室パネルを設置します")
+@bot.tree.command(name="setup_private_panel", description="個室作成パネルを設置")
 @app_commands.guild_only()
 async def setup_private_panel(interaction: discord.Interaction) -> None:
-    member = interaction.user
-    if not isinstance(member, discord.Member) or not is_bot_admin(member):
-        await interaction.response.send_message(
-            "管理者専用コマンドです。",
-            ephemeral=True,
-        )
+    if not admin_only(interaction):
+        await interaction.response.send_message("管理者専用です。", ephemeral=True)
         return
 
     embed = discord.Embed(
         title="➕ 個室作成",
         description=(
-            "⭕ **表個室**\n"
-            "サーバー内全員が閲覧できます。\n"
-            "接続できるのは作成者と選択した人だけです。\n\n"
-            "🚫 **裏個室**\n"
-            "作成者と選択した人だけが閲覧・接続できます。\n\n"
-            "ユーザー選択、またはお気に入り選択から作成できます。"
+            "⭕ **表個室**\n全員から見えますが、選択した人だけ接続できます。\n\n"
+            "🚫 **裏個室**\n作成者と選択した人だけ閲覧・接続できます。"
         ),
         color=discord.Color.green(),
     )
     await interaction.channel.send(embed=embed, view=PrivatePanel())
-    await interaction.response.send_message(
-        "✅ 個室作成パネルを設置しました。",
-        ephemeral=True,
+    await interaction.response.send_message("✅ 設置しました。", ephemeral=True)
+
+
+@bot.tree.command(name="setup_now_panel", description="なう募集パネルを設置")
+@app_commands.guild_only()
+async def setup_now_panel(interaction: discord.Interaction) -> None:
+    if not admin_only(interaction):
+        await interaction.response.send_message("管理者専用です。", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🐣 なう募集",
+        description=(
+            "男性／女性／全員に\n"
+            "「誰か話そう」という募集をかけることができます。\n\n"
+            "💎 **男性宛**\n"
+            "💗 **女性宛**\n"
+            "🐣 **全員宛**"
+        ),
+        color=discord.Color.from_rgb(255, 190, 70),
     )
+    await interaction.channel.send(embed=embed, view=NowPanel())
+    await interaction.response.send_message("✅ なう募集パネルを設置しました。", ephemeral=True)
 
 
-@bot.tree.command(name="mylist_add", description="ユーザーをマイリストに追加します")
+@bot.tree.command(name="setup_recruitment_panels", description="裏募集作成パネルを設置")
+@app_commands.guild_only()
+async def setup_recruitment_panels(interaction: discord.Interaction) -> None:
+    if not admin_only(interaction):
+        await interaction.response.send_message("管理者専用です。", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        return
+
+    channel = get_text_channel(guild, RECRUIT_CREATE_PANEL_CHANNEL_ID) or interaction.channel
+    embed = discord.Embed(
+        title="🌙 フィルタリング付き裏募集",
+        description=(
+            "募集方法を選択してください。\n\n"
+            "🎭 **匿名で募集**\n"
+            "募集主を伏せた状態で投稿します。\n\n"
+            "🪪 **記名で募集**\n"
+            "募集主を表示して投稿します。\n\n"
+            "ブラックリスト関係の相手は応募できません。"
+        ),
+        color=discord.Color.dark_purple(),
+    )
+    await channel.send(embed=embed, view=FilterRecruitPanel())
+    await interaction.response.send_message("✅ 裏募集作成パネルを設置しました。", ephemeral=True)
+
+
+@bot.tree.command(name="mylist_add", description="マイリストに追加")
 @app_commands.describe(user="追加するユーザー")
 @app_commands.guild_only()
-async def mylist_add(
-    interaction: discord.Interaction,
-    user: discord.Member,
-) -> None:
+async def mylist_add(interaction: discord.Interaction, user: discord.Member) -> None:
     if user.bot or user.id == interaction.user.id:
-        await interaction.response.send_message(
-            "自分自身またはBotは追加できません。",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("自分自身またはBotは追加できません。", ephemeral=True)
         return
     if is_blocked_either_way(interaction.user.id, user.id):
-        await interaction.response.send_message(
-            "ブラックリスト関係のユーザーは追加できません。",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("ブラックリスト関係の相手は追加できません。", ephemeral=True)
         return
 
-    added = add_favorite(interaction.user.id, user.id)
+    added = add_pair("favorites", interaction.user.id, user.id)
     await interaction.response.send_message(
-        (
-            f"⭐ {user.mention} をマイリストに追加しました。"
-            if added
-            else f"{user.mention} はすでにマイリストに入っています。"
-        ),
+        f"⭐ {user.mention} をマイリストに追加しました。"
+        if added else "すでに登録されています。",
         ephemeral=True,
     )
 
 
-@bot.tree.command(name="mylist_remove", description="ユーザーをマイリストから削除します")
+@bot.tree.command(name="mylist_remove", description="マイリストから削除")
 @app_commands.describe(user="削除するユーザー")
 @app_commands.guild_only()
-async def mylist_remove(
-    interaction: discord.Interaction,
-    user: discord.Member,
-) -> None:
-    removed = remove_favorite(interaction.user.id, user.id)
+async def mylist_remove(interaction: discord.Interaction, user: discord.Member) -> None:
+    removed = remove_pair("favorites", interaction.user.id, user.id)
     await interaction.response.send_message(
-        (
-            f"🗑️ {user.mention} をマイリストから削除しました。"
-            if removed
-            else f"{user.mention} はマイリストに登録されていません。"
-        ),
+        f"🗑️ {user.mention} を削除しました。" if removed else "登録されていません。",
         ephemeral=True,
     )
 
 
-@bot.tree.command(name="mylist_view", description="自分のマイリストを確認します")
+@bot.tree.command(name="mylist_view", description="マイリストを表示")
 @app_commands.guild_only()
 async def mylist_view(interaction: discord.Interaction) -> None:
     guild = interaction.guild
-    ids = get_favorites(interaction.user.id)
-    names: list[str] = []
-
+    lines = []
     if guild:
-        for user_id in ids:
-            member = guild.get_member(user_id)
-            names.append(member.mention if member else f"不明なユーザー ({user_id})")
-
-    text = "\n".join(f"・{name}" for name in names) or "登録されていません。"
+        for uid in get_pairs("favorites", interaction.user.id):
+            member = guild.get_member(uid)
+            lines.append(member.mention if member else f"`{uid}`")
     await interaction.response.send_message(
-        f"⭐ **あなたのマイリスト**\n{text}",
+        "⭐ **マイリスト**\n" + ("\n".join(f"・{x}" for x in lines) if lines else "登録なし"),
         ephemeral=True,
     )
 
 
-@bot.tree.command(name="blacklist_add", description="ユーザーをブラックリストに追加します")
+@bot.tree.command(name="blacklist_add", description="ブラックリストに追加")
 @app_commands.describe(user="追加するユーザー")
 @app_commands.guild_only()
-async def blacklist_add(
-    interaction: discord.Interaction,
-    user: discord.Member,
-) -> None:
+async def blacklist_add(interaction: discord.Interaction, user: discord.Member) -> None:
     if user.bot or user.id == interaction.user.id:
-        await interaction.response.send_message(
-            "自分自身またはBotは追加できません。",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("自分自身またはBotは追加できません。", ephemeral=True)
         return
 
-    added = add_blacklist(interaction.user.id, user.id)
-    remove_favorite(interaction.user.id, user.id)
-
+    added = add_pair("blacklist", interaction.user.id, user.id)
+    remove_pair("favorites", interaction.user.id, user.id)
     await interaction.response.send_message(
-        (
-            f"🚫 {user.mention} をブラックリストに追加しました。"
-            if added
-            else f"{user.mention} はすでにブラックリストに入っています。"
-        ),
+        f"🚫 {user.mention} をブラックリストに追加しました。"
+        if added else "すでに登録されています。",
         ephemeral=True,
     )
 
 
-@bot.tree.command(name="blacklist_remove", description="ユーザーをブラックリストから削除します")
+@bot.tree.command(name="blacklist_remove", description="ブラックリストから削除")
 @app_commands.describe(user="解除するユーザー")
 @app_commands.guild_only()
-async def blacklist_remove(
-    interaction: discord.Interaction,
-    user: discord.Member,
-) -> None:
-    removed = remove_blacklist(interaction.user.id, user.id)
+async def blacklist_remove(interaction: discord.Interaction, user: discord.Member) -> None:
+    removed = remove_pair("blacklist", interaction.user.id, user.id)
     await interaction.response.send_message(
-        (
-            f"✅ {user.mention} のブラックリスト登録を解除しました。"
-            if removed
-            else f"{user.mention} はブラックリストに登録されていません。"
-        ),
+        f"✅ {user.mention} を解除しました。" if removed else "登録されていません。",
         ephemeral=True,
     )
 
 
-@bot.tree.command(name="blacklist_view", description="自分のブラックリストを確認します")
+@bot.tree.command(name="blacklist_view", description="ブラックリストを表示")
 @app_commands.guild_only()
 async def blacklist_view(interaction: discord.Interaction) -> None:
     guild = interaction.guild
-    ids = get_blacklist(interaction.user.id)
-    names: list[str] = []
-
+    lines = []
     if guild:
-        for user_id in ids:
-            member = guild.get_member(user_id)
-            names.append(member.mention if member else f"不明なユーザー ({user_id})")
-
-    text = "\n".join(f"・{name}" for name in names) or "登録されていません。"
+        for uid in get_pairs("blacklist", interaction.user.id):
+            member = guild.get_member(uid)
+            lines.append(member.mention if member else f"`{uid}`")
     await interaction.response.send_message(
-        f"🚫 **あなたのブラックリスト**\n{text}",
+        "🚫 **ブラックリスト**\n" + ("\n".join(f"・{x}" for x in lines) if lines else "登録なし"),
         ephemeral=True,
     )
 
 
-@bot.tree.command(name="room_delete", description="自分が作成した部屋を削除します")
-@app_commands.describe(channel="削除するボイスチャンネル")
+@bot.tree.command(name="room_delete", description="自分の作成部屋を削除")
+@app_commands.describe(channel="削除するVC")
 @app_commands.guild_only()
-async def room_delete(
-    interaction: discord.Interaction,
-    channel: discord.VoiceChannel,
-) -> None:
+async def room_delete(interaction: discord.Interaction, channel: discord.VoiceChannel) -> None:
     row = get_room(channel.id)
     member = interaction.user
-
     if row is None:
-        await interaction.response.send_message(
-            "このBotで作成した部屋ではありません。",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("Bot作成部屋ではありません。", ephemeral=True)
         return
 
-    allowed = (
-        int(row["owner_id"]) == interaction.user.id
-        or (isinstance(member, discord.Member) and is_bot_admin(member))
-    )
-    if not allowed:
-        await interaction.response.send_message(
-            "作成者または管理者だけ削除できます。",
-            ephemeral=True,
-        )
+    if int(row["owner_id"]) != interaction.user.id and not (
+        isinstance(member, discord.Member) and is_bot_admin(member)
+    ):
+        await interaction.response.send_message("作成者または管理者だけ削除できます。", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
-    try:
-        await channel.delete(reason=f"{interaction.user} が部屋を削除")
-        delete_room_record(channel.id)
-        await interaction.followup.send("✅ 部屋を削除しました。", ephemeral=True)
-    except discord.Forbidden:
-        await interaction.followup.send(
-            "Botにチャンネル管理権限がありません。",
-            ephemeral=True,
-        )
+    await channel.delete(reason=f"{interaction.user} が削除")
+    delete_room_record(channel.id)
+    await interaction.followup.send("✅ 削除しました。", ephemeral=True)
 
 
-@bot.tree.command(name="room_invite", description="自分の作成部屋にユーザーを招待します")
-@app_commands.describe(channel="招待先の部屋", user="招待するユーザー")
+@bot.tree.command(name="room_invite", description="自分の部屋にユーザーを招待")
+@app_commands.describe(channel="招待先VC", user="招待するユーザー")
 @app_commands.guild_only()
 async def room_invite(
     interaction: discord.Interaction,
@@ -1489,42 +1579,25 @@ async def room_invite(
 ) -> None:
     row = get_room(channel.id)
     if row is None or int(row["owner_id"]) != interaction.user.id:
-        await interaction.response.send_message(
-            "自分が作成した部屋だけ操作できます。",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("自分の作成部屋だけ操作できます。", ephemeral=True)
         return
-
     if is_blocked_either_way(interaction.user.id, user.id):
-        await interaction.response.send_message(
-            "ブラックリスト関係のユーザーは招待できません。",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("ブラックリスト関係の相手は招待できません。", ephemeral=True)
         return
 
-    try:
-        await channel.set_permissions(
-            user,
-            view_channel=True,
-            connect=True,
-            speak=True,
-            stream=True,
-            use_voice_activation=True,
-            reason=f"{interaction.user} が招待",
-        )
-        await interaction.response.send_message(
-            f"✅ {user.mention} を {channel.mention} に招待しました。",
-            ephemeral=True,
-        )
-    except discord.Forbidden:
-        await interaction.response.send_message(
-            "Botに権限管理の権限がありません。",
-            ephemeral=True,
-        )
+    await channel.set_permissions(
+        user,
+        view_channel=True,
+        connect=True,
+        speak=True,
+        stream=True,
+        use_voice_activation=True,
+    )
+    await interaction.response.send_message(f"✅ {user.mention} を招待しました。", ephemeral=True)
 
 
-@bot.tree.command(name="room_uninvite", description="自分の作成部屋からユーザーを解除します")
-@app_commands.describe(channel="対象の部屋", user="解除するユーザー")
+@bot.tree.command(name="room_uninvite", description="自分の部屋からユーザーを解除")
+@app_commands.describe(channel="対象VC", user="解除するユーザー")
 @app_commands.guild_only()
 async def room_uninvite(
     interaction: discord.Interaction,
@@ -1533,41 +1606,16 @@ async def room_uninvite(
 ) -> None:
     row = get_room(channel.id)
     if row is None or int(row["owner_id"]) != interaction.user.id:
-        await interaction.response.send_message(
-            "自分が作成した部屋だけ操作できます。",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("自分の作成部屋だけ操作できます。", ephemeral=True)
         return
 
-    try:
-        if user.voice and user.voice.channel and user.voice.channel.id == channel.id:
-            await user.move_to(None, reason="個室の招待解除")
+    if user.voice and user.voice.channel and user.voice.channel.id == channel.id:
+        await user.move_to(None, reason="招待解除")
+    await channel.set_permissions(user, overwrite=None)
+    await interaction.response.send_message(f"✅ {user.mention} の招待を解除しました。", ephemeral=True)
 
-        # 表個室なら閲覧は全員設定に戻り、接続不可になる
-        await channel.set_permissions(
-            user,
-            overwrite=None,
-            reason=f"{interaction.user} が招待解除",
-        )
-        await interaction.response.send_message(
-            f"✅ {user.mention} の招待を解除しました。",
-            ephemeral=True,
-        )
-    except discord.Forbidden:
-        await interaction.response.send_message(
-            "Botに権限管理またはメンバー移動権限がありません。",
-            ephemeral=True,
-        )
-
-
-# =========================================================
-# 起動
-# =========================================================
 
 if __name__ == "__main__":
     if not TOKEN or TOKEN == "ここにBOTトークン":
-        raise RuntimeError(
-            "TOKENを設定してください。環境変数 DISCORD_TOKEN またはコード上部のTOKENを使用できます。"
-        )
-
+        raise RuntimeError("環境変数 DISCORD_TOKEN を設定してください。")
     bot.run(TOKEN)
