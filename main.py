@@ -465,10 +465,16 @@ async def create_room(
         female = guild.get_role(FEMALE_ROLE_ID)
         if male and female:
             if male in owner.roles:
-                overwrites[female] = discord.PermissionOverwrite(view_channel=True, connect=True)
+                overwrites[female] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    connect=("knock" not in spec.room_type),
+                )
                 overwrites[male] = discord.PermissionOverwrite(view_channel=False, connect=False)
             elif female in owner.roles:
-                overwrites[male] = discord.PermissionOverwrite(view_channel=True, connect=True)
+                overwrites[male] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    connect=("knock" not in spec.room_type),
+                )
                 overwrites[female] = discord.PermissionOverwrite(view_channel=False, connect=False)
 
     for blocked_id in set(get_pairs("blacklist", owner.id)):
@@ -502,8 +508,630 @@ async def create_room(
         spec.hidden_when_two,
         spec.timed,
     )
+
+    # VC内チャットへ管理メニューを自動設置
+    try:
+        menu_embed = build_vc_menu_embed(channel, owner, spec.room_type)
+        await channel.send(embed=menu_embed, view=VCMenuView())
+    except discord.Forbidden:
+        log.warning("VC内チャットへ管理メニューを送信できません: %s", channel.id)
+    except discord.HTTPException:
+        log.exception("VC管理メニュー送信失敗: %s", channel.id)
+
     await interaction.followup.send(f"✅ {channel.mention} を作成しました。", ephemeral=True)
     return channel
+
+
+
+# =========================================================
+# VC内チャット管理メニュー
+# =========================================================
+
+def get_interaction_voice_channel(
+    interaction: discord.Interaction,
+) -> Optional[discord.VoiceChannel]:
+    return (
+        interaction.channel
+        if isinstance(interaction.channel, discord.VoiceChannel)
+        else None
+    )
+
+
+def get_owned_room(
+    interaction: discord.Interaction,
+) -> tuple[Optional[discord.VoiceChannel], Optional[sqlite3.Row]]:
+    channel = get_interaction_voice_channel(interaction)
+    if channel is None:
+        return None, None
+    return channel, get_room(channel.id)
+
+
+async def require_room_owner(
+    interaction: discord.Interaction,
+) -> tuple[Optional[discord.VoiceChannel], Optional[sqlite3.Row]]:
+    channel, row = get_owned_room(interaction)
+    if channel is None or row is None:
+        await interaction.response.send_message(
+            "このBotが作成したVC内で使用してください。",
+            ephemeral=True,
+        )
+        return None, None
+
+    member = interaction.user
+    allowed = (
+        interaction.user.id == int(row["owner_id"])
+        or (isinstance(member, discord.Member) and is_bot_admin(member))
+    )
+    if not allowed:
+        await interaction.response.send_message(
+            "部屋の作成者または管理者だけ操作できます。",
+            ephemeral=True,
+        )
+        return None, None
+
+    return channel, row
+
+
+def build_vc_menu_embed(
+    channel: discord.VoiceChannel,
+    owner: discord.Member,
+    room_type: str,
+) -> discord.Embed:
+    knock_text = "ON" if "knock" in room_type else "OFF"
+    timed_text = "10分制" if "timed" in room_type else "なし"
+
+    embed = discord.Embed(
+        title="VCメニュー",
+        description=(
+            "🍰 **名前／ステータス変更**\n"
+            "部屋名とチャンネルステータスを変更できます。\n\n"
+            "🌟 **ビットレート変更**\n"
+            "VCの音質を変更できます。\n\n"
+            "🛌 **寝落ち切断**\n"
+            "指定時間後、入室中のメンバーを切断します。\n\n"
+            "🐑 **権限確認**\n"
+            "現在の部屋の閲覧・接続権限を確認できます。\n\n"
+            "🚪 **ノック**\n"
+            "ノック部屋では、作成者へ入室申請を送れます。\n\n"
+            "🔒 **ロック／解除**\n"
+            "新しい入室を止めたり、再開できます。\n\n"
+            "🗑️ **部屋削除**\n"
+            "作成したVCを閉じます。"
+        ),
+        color=discord.Color.from_rgb(238, 197, 135),
+    )
+    embed.add_field(name="👑 作成者", value=owner.mention, inline=True)
+    embed.add_field(name="🚪 ノック", value=knock_text, inline=True)
+    embed.add_field(name="⏰ タイマー", value=timed_text, inline=True)
+    embed.set_footer(text=f"チャンネルID: {channel.id}")
+    return embed
+
+
+class VCNameStatusModal(discord.ui.Modal):
+    def __init__(self, channel: discord.VoiceChannel):
+        super().__init__(title="名前／ステータス変更")
+        self.channel_id = channel.id
+
+        self.room_name = discord.ui.TextInput(
+            label="新しい部屋名",
+            default=channel.name[:100],
+            max_length=100,
+        )
+        self.status = discord.ui.TextInput(
+            label="チャンネルステータス",
+            placeholder="空欄の場合は変更しません",
+            max_length=500,
+            required=False,
+        )
+        self.add_item(self.room_name)
+        self.add_item(self.status)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        channel, row = await require_room_owner(interaction)
+        if channel is None or row is None:
+            return
+
+        new_name = clean_channel_name(str(self.room_name.value))
+        try:
+            await channel.edit(
+                name=new_name,
+                reason=f"{interaction.user} がVC名を変更",
+            )
+
+            status_text = str(self.status.value).strip()
+            if status_text:
+                setter = getattr(channel, "set_status", None)
+                if setter:
+                    try:
+                        await setter(status=status_text[:500])
+                    except Exception:
+                        log.exception("VCステータス変更失敗: %s", channel.id)
+
+            await interaction.response.send_message(
+                f"✅ 部屋名を **{new_name}** に変更しました。",
+                ephemeral=True,
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "Botにチャンネル管理権限がありません。",
+                ephemeral=True,
+            )
+
+
+class VCBitrateModal(discord.ui.Modal):
+    def __init__(self, channel: discord.VoiceChannel):
+        super().__init__(title="ビットレート変更")
+        self.channel_id = channel.id
+        self.bitrate = discord.ui.TextInput(
+            label="ビットレート（kbps）",
+            placeholder="例：64",
+            default=str(max(8, channel.bitrate // 1000)),
+            min_length=1,
+            max_length=3,
+        )
+        self.add_item(self.bitrate)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        channel, row = await require_room_owner(interaction)
+        if channel is None or row is None:
+            return
+
+        try:
+            requested = int(str(self.bitrate.value))
+        except ValueError:
+            await interaction.response.send_message(
+                "数字だけを入力してください。",
+                ephemeral=True,
+            )
+            return
+
+        max_kbps = max(8, channel.guild.bitrate_limit // 1000)
+        requested = max(8, min(requested, max_kbps))
+
+        try:
+            await channel.edit(
+                bitrate=requested * 1000,
+                reason=f"{interaction.user} がビットレートを変更",
+            )
+            await interaction.response.send_message(
+                f"✅ ビットレートを **{requested}kbps** に変更しました。",
+                ephemeral=True,
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "Botにチャンネル管理権限がありません。",
+                ephemeral=True,
+            )
+
+
+class VCSleepDisconnectModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="寝落ち切断")
+        self.minutes = discord.ui.TextInput(
+            label="何分後に切断しますか？",
+            placeholder="例：60",
+            default="60",
+            max_length=4,
+        )
+        self.add_item(self.minutes)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        channel, row = await require_room_owner(interaction)
+        if channel is None or row is None:
+            return
+
+        try:
+            minutes = int(str(self.minutes.value))
+        except ValueError:
+            await interaction.response.send_message(
+                "数字だけを入力してください。",
+                ephemeral=True,
+            )
+            return
+
+        if not 1 <= minutes <= 1440:
+            await interaction.response.send_message(
+                "1～1440分で指定してください。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"🛌 **{minutes}分後**に、入室中のメンバーを切断します。",
+            ephemeral=True,
+        )
+
+        async def disconnect_later() -> None:
+            await asyncio.sleep(minutes * 60)
+            current = channel.guild.get_channel(channel.id)
+            if not isinstance(current, discord.VoiceChannel):
+                return
+            for member in list(current.members):
+                if member.bot:
+                    continue
+                try:
+                    await member.move_to(None, reason="寝落ち切断タイマー")
+                except discord.HTTPException:
+                    log.exception("寝落ち切断失敗: %s", member.id)
+
+        asyncio.create_task(disconnect_later())
+
+
+class KnockDecisionView(discord.ui.View):
+    def __init__(self, channel_id: int, applicant_id: int):
+        super().__init__(timeout=15 * 60)
+        self.channel_id = channel_id
+        self.applicant_id = applicant_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        row = get_room(self.channel_id)
+        if row is None:
+            await interaction.response.send_message(
+                "部屋がすでに削除されています。",
+                ephemeral=True,
+            )
+            return False
+
+        member = interaction.user
+        if interaction.user.id != int(row["owner_id"]) and not (
+            isinstance(member, discord.Member) and is_bot_admin(member)
+        ):
+            await interaction.response.send_message(
+                "部屋の作成者または管理者だけ操作できます。",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="入室許可",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+    )
+    async def approve(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        guild = interaction.guild
+        channel = guild.get_channel(self.channel_id) if guild else None
+        applicant = guild.get_member(self.applicant_id) if guild else None
+
+        if not isinstance(channel, discord.VoiceChannel) or applicant is None:
+            await interaction.response.send_message(
+                "対象の部屋またはユーザーが見つかりません。",
+                ephemeral=True,
+            )
+            return
+
+        if is_blocked_either_way(int(get_room(channel.id)["owner_id"]), applicant.id):
+            await interaction.response.send_message(
+                "ブラックリスト関係のため許可できません。",
+                ephemeral=True,
+            )
+            return
+
+        await channel.set_permissions(
+            applicant,
+            view_channel=True,
+            connect=True,
+            speak=True,
+            stream=True,
+            use_voice_activation=True,
+            reason="ノック承認",
+        )
+        try:
+            await applicant.send(
+                f"✅ **{guild.name}** の {channel.mention} へのノックが承認されました。"
+            )
+        except discord.HTTPException:
+            pass
+
+        await interaction.response.edit_message(
+            content=f"✅ {applicant.mention} の入室を許可しました。",
+            view=None,
+        )
+
+    @discord.ui.button(
+        label="お断り",
+        emoji="❌",
+        style=discord.ButtonStyle.danger,
+    )
+    async def reject(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        guild = interaction.guild
+        applicant = guild.get_member(self.applicant_id) if guild else None
+        if applicant:
+            try:
+                await applicant.send(
+                    f"今回はノックが見送られました。"
+                )
+            except discord.HTTPException:
+                pass
+
+        await interaction.response.edit_message(
+            content=f"❌ <@{self.applicant_id}> のノックをお断りしました。",
+            view=None,
+        )
+
+
+class VCMenuView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="名前／ステータス変更",
+        emoji="🍰",
+        style=discord.ButtonStyle.secondary,
+        custom_id="noir:vc:name_status",
+        row=0,
+    )
+    async def name_status(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        channel, row = get_owned_room(interaction)
+        if channel is None or row is None:
+            await interaction.response.send_message(
+                "このBotが作成したVC内で使用してください。",
+                ephemeral=True,
+            )
+            return
+
+        member = interaction.user
+        if interaction.user.id != int(row["owner_id"]) and not (
+            isinstance(member, discord.Member) and is_bot_admin(member)
+        ):
+            await interaction.response.send_message(
+                "部屋の作成者または管理者だけ操作できます。",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(VCNameStatusModal(channel))
+
+    @discord.ui.button(
+        label="ビットレート変更",
+        emoji="🌟",
+        style=discord.ButtonStyle.secondary,
+        custom_id="noir:vc:bitrate",
+        row=0,
+    )
+    async def bitrate(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        channel, row = get_owned_room(interaction)
+        if channel is None or row is None:
+            await interaction.response.send_message(
+                "このBotが作成したVC内で使用してください。",
+                ephemeral=True,
+            )
+            return
+
+        member = interaction.user
+        if interaction.user.id != int(row["owner_id"]) and not (
+            isinstance(member, discord.Member) and is_bot_admin(member)
+        ):
+            await interaction.response.send_message(
+                "部屋の作成者または管理者だけ操作できます。",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(VCBitrateModal(channel))
+
+    @discord.ui.button(
+        label="寝落ち切断",
+        emoji="🛌",
+        style=discord.ButtonStyle.secondary,
+        custom_id="noir:vc:sleep_disconnect",
+        row=1,
+    )
+    async def sleep_disconnect(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        channel, row = get_owned_room(interaction)
+        if channel is None or row is None:
+            await interaction.response.send_message(
+                "このBotが作成したVC内で使用してください。",
+                ephemeral=True,
+            )
+            return
+
+        member = interaction.user
+        if interaction.user.id != int(row["owner_id"]) and not (
+            isinstance(member, discord.Member) and is_bot_admin(member)
+        ):
+            await interaction.response.send_message(
+                "部屋の作成者または管理者だけ操作できます。",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(VCSleepDisconnectModal())
+
+    @discord.ui.button(
+        label="権限確認",
+        emoji="🐑",
+        style=discord.ButtonStyle.secondary,
+        custom_id="noir:vc:permissions",
+        row=1,
+    )
+    async def permissions(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        channel, row = get_owned_room(interaction)
+        if channel is None or row is None:
+            await interaction.response.send_message(
+                "このBotが作成したVC内で使用してください。",
+                ephemeral=True,
+            )
+            return
+
+        visible_members = []
+        connect_members = []
+        for member in channel.guild.members:
+            if member.bot:
+                continue
+            perms = channel.permissions_for(member)
+            if perms.view_channel:
+                visible_members.append(member.display_name)
+            if perms.connect:
+                connect_members.append(member.display_name)
+
+        visible_text = "、".join(visible_members[:30]) or "なし"
+        connect_text = "、".join(connect_members[:30]) or "なし"
+        if len(visible_members) > 30:
+            visible_text += f" ほか{len(visible_members) - 30}名"
+        if len(connect_members) > 30:
+            connect_text += f" ほか{len(connect_members) - 30}名"
+
+        await interaction.response.send_message(
+            f"👀 **閲覧可能**\n{visible_text}\n\n"
+            f"🎙️ **接続可能**\n{connect_text}",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="ノック",
+        emoji="🚪",
+        style=discord.ButtonStyle.primary,
+        custom_id="noir:vc:knock",
+        row=2,
+    )
+    async def knock(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        channel, row = get_owned_room(interaction)
+        if channel is None or row is None:
+            await interaction.response.send_message(
+                "このBotが作成したVC内で使用してください。",
+                ephemeral=True,
+            )
+            return
+
+        if "knock" not in str(row["room_type"]):
+            await interaction.response.send_message(
+                "この部屋はノック部屋ではありません。",
+                ephemeral=True,
+            )
+            return
+
+        owner_id = int(row["owner_id"])
+        if interaction.user.id == owner_id:
+            await interaction.response.send_message(
+                "作成者本人はノック不要です。",
+                ephemeral=True,
+            )
+            return
+
+        if is_blocked_either_way(owner_id, interaction.user.id):
+            await interaction.response.send_message(
+                "ブラックリスト関係のためノックできません。",
+                ephemeral=True,
+            )
+            return
+
+        owner = channel.guild.get_member(owner_id)
+        await channel.send(
+            content=(
+                f"{owner.mention if owner else f'<@{owner_id}>'}\n"
+                f"🚪 {interaction.user.mention} さんがノックしました！"
+            ),
+            view=KnockDecisionView(channel.id, interaction.user.id),
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+        await interaction.response.send_message(
+            "🚪 ノックを送りました。入室許可をお待ちください。",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="ロック／解除",
+        emoji="🔒",
+        style=discord.ButtonStyle.primary,
+        custom_id="noir:vc:lock_toggle",
+        row=2,
+    )
+    async def lock_toggle(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        channel, row = await require_room_owner(interaction)
+        if channel is None or row is None:
+            return
+
+        everyone = channel.guild.default_role
+        current = channel.overwrites_for(everyone)
+        currently_locked = current.connect is False
+
+        # 表示は維持しつつ接続だけ切り替える
+        current.connect = True if currently_locked else False
+        await channel.set_permissions(
+            everyone,
+            overwrite=current,
+            reason=f"{interaction.user} がロック切替",
+        )
+
+        # 性別ロールに明示許可がある場合も合わせて切替
+        for role_id in (MALE_ROLE_ID, FEMALE_ROLE_ID):
+            role = channel.guild.get_role(role_id)
+            if role is None:
+                continue
+            overwrite = channel.overwrites_for(role)
+            if overwrite.view_channel is True:
+                overwrite.connect = (
+                    False
+                    if not currently_locked
+                    else ("knock" not in str(row["room_type"]))
+                )
+                await channel.set_permissions(
+                    role,
+                    overwrite=overwrite,
+                    reason=f"{interaction.user} がロック切替",
+                )
+
+        await interaction.response.send_message(
+            "🔓 ロックを解除しました。"
+            if currently_locked
+            else "🔒 部屋をロックしました。",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="部屋削除",
+        emoji="🗑️",
+        style=discord.ButtonStyle.danger,
+        custom_id="noir:vc:delete",
+        row=2,
+    )
+    async def delete_room(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        channel, row = await require_room_owner(interaction)
+        if channel is None or row is None:
+            return
+
+        await interaction.response.send_message(
+            "🗑️ 部屋を削除します。",
+            ephemeral=True,
+        )
+        try:
+            await channel.delete(reason=f"{interaction.user} がVCメニューから削除")
+        finally:
+            delete_room_record(channel.id)
 
 
 # =========================================================
@@ -1220,6 +1848,7 @@ class NoirBot(commands.Bot):
 
         self.add_view(QuickPanel())
         self.add_view(PrivatePanel())
+        self.add_view(VCMenuView())
         self.add_view(NowPanel())
         self.add_view(FilterRecruitPanel())
         self.add_view(RecruitActionView())
