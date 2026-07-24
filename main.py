@@ -402,6 +402,91 @@ async def send_log(guild: discord.Guild, text: str) -> None:
             log.exception("ログ送信失敗")
 
 
+
+def quick_role_connect_settings(
+    room_type: str,
+    owner: discord.Member,
+) -> tuple[bool, bool]:
+    """
+    戻り値: (男性ロールが接続可能か, 女性ロールが接続可能か)
+    クイック作成部屋は男女ロールから必ず見えるようにし、
+    接続可否だけを部屋タイプに合わせて制御します。
+    """
+    # マイリスト部屋は表示のみ。接続は選択されたメンバーだけ。
+    if "mylist" in room_type:
+        return False, False
+
+    # ノック部屋は表示のみ。承認後に個別で接続権限を付ける。
+    if "knock" in room_type:
+        return False, False
+
+    owner_is_male = owner.get_role(MALE_ROLE_ID) is not None
+    owner_is_female = owner.get_role(FEMALE_ROLE_ID) is not None
+
+    # 同性NG
+    same_gender_ng = (
+        room_type.startswith("private_qm_ng_")
+        or room_type in {"sleep_normal_ng", "sleep_knock_ng"}
+    )
+    if same_gender_ng:
+        if owner_is_male:
+            return False, True
+        if owner_is_female:
+            return True, False
+        return True, True
+
+    # それ以外のクイック作成部屋は男女とも接続可能
+    return True, True
+
+
+def is_quick_room_type(room_type: str) -> bool:
+    return room_type.startswith(
+        (
+            "public_mylist",
+            "private_mylist",
+            "public_qm_",
+            "public_timed",
+            "private_timed",
+            "sleep_",
+            "eroip_",
+            "private_qm_",
+        )
+    )
+
+
+async def apply_quick_role_visibility(
+    channel: discord.VoiceChannel,
+    owner: discord.Member,
+    room_type: str,
+) -> None:
+    """
+    既存部屋にも使える権限補正。
+    男性・女性ロールはクイック部屋を必ず閲覧できます。
+    """
+    if not is_quick_room_type(room_type):
+        return
+
+    male_role = channel.guild.get_role(MALE_ROLE_ID)
+    female_role = channel.guild.get_role(FEMALE_ROLE_ID)
+    male_connect, female_connect = quick_role_connect_settings(room_type, owner)
+
+    if male_role:
+        await channel.set_permissions(
+            male_role,
+            view_channel=True,
+            connect=male_connect,
+            reason="クイック作成部屋を男性ロールから表示",
+        )
+
+    if female_role:
+        await channel.set_permissions(
+            female_role,
+            view_channel=True,
+            connect=female_connect,
+            reason="クイック作成部屋を女性ロールから表示",
+        )
+
+
 async def create_room(
     interaction: discord.Interaction,
     spec: RoomSpec,
@@ -460,6 +545,23 @@ async def create_room(
             use_voice_activation=True,
         )
 
+    # クイック作成部屋は、男性・女性ロールから必ず見えるようにする
+    if is_quick_room_type(spec.room_type):
+        male_role = guild.get_role(MALE_ROLE_ID)
+        female_role = guild.get_role(FEMALE_ROLE_ID)
+        male_connect, female_connect = quick_role_connect_settings(spec.room_type, owner)
+
+        if male_role:
+            overwrites[male_role] = discord.PermissionOverwrite(
+                view_channel=True,
+                connect=male_connect,
+            )
+        if female_role:
+            overwrites[female_role] = discord.PermissionOverwrite(
+                view_channel=True,
+                connect=female_connect,
+            )
+
     if spec.opposite_gender_only:
         male = guild.get_role(MALE_ROLE_ID)
         female = guild.get_role(FEMALE_ROLE_ID)
@@ -469,13 +571,13 @@ async def create_room(
                     view_channel=True,
                     connect=("knock" not in spec.room_type),
                 )
-                overwrites[male] = discord.PermissionOverwrite(view_channel=False, connect=False)
+                overwrites[male] = discord.PermissionOverwrite(view_channel=True, connect=False)
             elif female in owner.roles:
                 overwrites[male] = discord.PermissionOverwrite(
                     view_channel=True,
                     connect=("knock" not in spec.room_type),
                 )
-                overwrites[female] = discord.PermissionOverwrite(view_channel=False, connect=False)
+                overwrites[female] = discord.PermissionOverwrite(view_channel=True, connect=False)
 
     for blocked_id in set(get_pairs("blacklist", owner.id)):
         blocked = guild.get_member(blocked_id)
@@ -508,6 +610,14 @@ async def create_room(
         spec.hidden_when_two,
         spec.timed,
     )
+
+    # カテゴリ側の権限に関係なく、男女ロールへ明示的に表示権限を付ける
+    try:
+        await apply_quick_role_visibility(channel, owner, spec.room_type)
+    except discord.Forbidden:
+        log.warning("クイック部屋の男女ロール権限を設定できません: %s", channel.id)
+    except discord.HTTPException:
+        log.exception("クイック部屋権限設定失敗: %s", channel.id)
 
     # VC内チャットへ管理メニューを自動設置
     try:
@@ -1872,6 +1982,20 @@ class NoirBot(commands.Bot):
             channel = guild.get_channel(int(row["channel_id"])) if guild else None
             if not isinstance(channel, discord.VoiceChannel):
                 delete_room_record(int(row["channel_id"]))
+                continue
+
+            owner = guild.get_member(int(row["owner_id"])) if guild else None
+            if owner:
+                try:
+                    await apply_quick_role_visibility(
+                        channel,
+                        owner,
+                        str(row["room_type"]),
+                    )
+                except discord.Forbidden:
+                    log.warning("既存クイック部屋の権限補正に失敗: %s", channel.id)
+                except discord.HTTPException:
+                    log.exception("既存クイック部屋の権限補正エラー: %s", channel.id)
 
     async def start_room_timer(self, channel: discord.VoiceChannel) -> None:
         if channel.id in self.timer_tasks:
