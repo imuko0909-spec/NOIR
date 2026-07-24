@@ -1320,6 +1320,7 @@ class QuickChoiceSelect(discord.ui.Select):
                     room_type=f"{self.kind}_{value}",
                     public_view=False,
                     hidden_when_two=hidden,
+                    user_limit=0,
                 ),
                 allowed_members=members,
             )
@@ -1334,6 +1335,7 @@ class QuickChoiceSelect(discord.ui.Select):
                     category_id=QUICK_PUBLIC_CATEGORY_ID,
                     room_type=f"public_qm_{value}",
                     public_view=True,
+                    user_limit=0,
                 ),
             )
             return
@@ -1349,6 +1351,7 @@ class QuickChoiceSelect(discord.ui.Select):
                     room_type=f"sleep_{value}",
                     public_view=True,
                     hidden_when_two=True,
+                    user_limit=2,
                     opposite_gender_only=not same_ok,
                 ),
             )
@@ -1363,6 +1366,7 @@ class QuickChoiceSelect(discord.ui.Select):
                     room_type=f"eroip_{value}",
                     public_view=True,
                     hidden_when_two=True,
+                    user_limit=2,
                 ),
             )
             return
@@ -1377,6 +1381,7 @@ class QuickChoiceSelect(discord.ui.Select):
                     room_type=f"private_qm_{value}",
                     public_view=False,
                     hidden_when_two=True,
+                    user_limit=2,
                     opposite_gender_only=not same_ok,
                 ),
             )
@@ -1465,7 +1470,7 @@ class PrivateUserSelect(discord.ui.UserSelect):
         super().__init__(
             placeholder="招待するユーザーを選択",
             min_values=1,
-            max_values=10,
+            max_values=1,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -1490,6 +1495,8 @@ class PrivateUserSelect(discord.ui.UserSelect):
                 category_id=PRIVATE_HIDDEN_CATEGORY_ID if self.hidden else PRIVATE_PUBLIC_CATEGORY_ID,
                 room_type="hidden_private" if self.hidden else "public_private",
                 public_view=not self.hidden,
+                hidden_when_two=self.hidden,
+                user_limit=2,
             ),
             allowed_members=members,
         )
