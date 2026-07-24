@@ -475,6 +475,9 @@ async def apply_quick_role_visibility(
             male_role,
             view_channel=True,
             connect=male_connect,
+            send_messages=True,
+            read_message_history=True,
+            use_application_commands=True,
             reason="クイック作成部屋を男性ロールから表示",
         )
 
@@ -483,6 +486,9 @@ async def apply_quick_role_visibility(
             female_role,
             view_channel=True,
             connect=female_connect,
+            send_messages=True,
+            read_message_history=True,
+            use_application_commands=True,
             reason="クイック作成部屋を女性ロールから表示",
         )
 
@@ -520,6 +526,9 @@ async def create_room(
             speak=True,
             stream=True,
             use_voice_activation=True,
+            send_messages=True,
+            read_message_history=True,
+            use_application_commands=True,
             manage_channels=True,
             move_members=True,
         ),
@@ -543,6 +552,9 @@ async def create_room(
             speak=True,
             stream=True,
             use_voice_activation=True,
+            send_messages=True,
+            read_message_history=True,
+            use_application_commands=True,
         )
 
     # クイック作成部屋は、男性・女性ロールから必ず見えるようにする
@@ -555,11 +567,17 @@ async def create_room(
             overwrites[male_role] = discord.PermissionOverwrite(
                 view_channel=True,
                 connect=male_connect,
+                send_messages=True,
+                read_message_history=True,
+                use_application_commands=True,
             )
         if female_role:
             overwrites[female_role] = discord.PermissionOverwrite(
                 view_channel=True,
                 connect=female_connect,
+                send_messages=True,
+                read_message_history=True,
+                use_application_commands=True,
             )
 
     if spec.opposite_gender_only:
@@ -570,12 +588,18 @@ async def create_room(
                 overwrites[female] = discord.PermissionOverwrite(
                     view_channel=True,
                     connect=("knock" not in spec.room_type),
+                    send_messages=True,
+                    read_message_history=True,
+                    use_application_commands=True,
                 )
                 overwrites[male] = discord.PermissionOverwrite(view_channel=True, connect=False)
             elif female in owner.roles:
                 overwrites[male] = discord.PermissionOverwrite(
                     view_channel=True,
                     connect=("knock" not in spec.room_type),
+                    send_messages=True,
+                    read_message_history=True,
+                    use_application_commands=True,
                 )
                 overwrites[female] = discord.PermissionOverwrite(view_channel=True, connect=False)
 
@@ -928,6 +952,9 @@ class KnockDecisionView(discord.ui.View):
             speak=True,
             stream=True,
             use_voice_activation=True,
+            send_messages=True,
+            read_message_history=True,
+            use_application_commands=True,
             reason="ノック承認",
         )
         try:
