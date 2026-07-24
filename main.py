@@ -43,6 +43,10 @@ RECRUIT_CREATE_PANEL_CHANNEL_ID = 1524090558518132907
 RECRUIT_CONFIRM_CHANNEL_ID = 1529514190497386606
 RECRUIT_NOTIFICATION_CHANNEL_ID = 1521066957103693965
 RECRUIT_LOG_CHANNEL_ID = 1529623100986097764
+
+# ノックあり部屋の外部ノックパネル投稿先
+# 現在は「通知」チャンネルを使用します。
+KNOCK_PANEL_CHANNEL_ID = 1521066957103693965
 ANONYMOUS_NOTIFY_ROLE_ID = 1529620347157217331
 NAMED_NOTIFY_ROLE_ID = 1529620408951771306
 
@@ -90,7 +94,8 @@ def init_db() -> None:
                 room_type TEXT NOT NULL,
                 hidden_when_two INTEGER NOT NULL DEFAULT 0,
                 timed INTEGER NOT NULL DEFAULT 0,
-                timer_started INTEGER NOT NULL DEFAULT 0
+                timer_started INTEGER NOT NULL DEFAULT 0,
+                knock_message_id INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS now_recruitments (
@@ -133,6 +138,16 @@ def init_db() -> None:
             );
             """
         )
+
+        # 既存DB向けマイグレーション
+        columns = {
+            row["name"]
+            for row in con.execute("PRAGMA table_info(rooms)").fetchall()
+        }
+        if "knock_message_id" not in columns:
+            con.execute(
+                "ALTER TABLE rooms ADD COLUMN knock_message_id INTEGER NOT NULL DEFAULT 0"
+            )
 
 
 def utc_now() -> str:
@@ -225,6 +240,14 @@ def set_timer_started(channel_id: int, value: bool) -> None:
         con.execute(
             "UPDATE rooms SET timer_started=? WHERE channel_id=?",
             (int(value), channel_id),
+        )
+
+
+def set_knock_message_id(channel_id: int, message_id: int) -> None:
+    with db_connect() as con:
+        con.execute(
+            "UPDATE rooms SET knock_message_id=? WHERE channel_id=?",
+            (message_id, channel_id),
         )
 
 
@@ -643,6 +666,14 @@ async def create_room(
     except discord.HTTPException:
         log.exception("クイック部屋権限設定失敗: %s", channel.id)
 
+    # ノックあり部屋は通常テキストチャンネルへノックパネルを設置
+    try:
+        await post_external_knock_panel(channel, owner, spec.room_type)
+    except discord.Forbidden:
+        log.warning("外部ノックパネルを投稿できません: %s", channel.id)
+    except discord.HTTPException:
+        log.exception("外部ノックパネル投稿失敗: %s", channel.id)
+
     # VC内チャットへ管理メニューを自動設置
     try:
         menu_embed = build_vc_menu_embed(channel, owner, spec.room_type)
@@ -655,6 +686,269 @@ async def create_room(
     await interaction.followup.send(f"✅ {channel.mention} を作成しました。", ephemeral=True)
     return channel
 
+
+
+
+# =========================================================
+# 外部ノックパネル
+# =========================================================
+
+def build_external_knock_embed(
+    channel: discord.VoiceChannel,
+    owner: discord.Member,
+    room_type: str,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="🚪 ノック受付中",
+        description=(
+            f"**部屋**\n{channel.mention}\n\n"
+            f"**部屋主**\n{owner.mention}\n\n"
+            "下のボタンからノックできます。\n"
+            "承認されるまではVCへ接続できません。"
+        ),
+        color=discord.Color.from_rgb(150, 100, 210),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="部屋タイプ", value=room_type, inline=False)
+    embed.set_thumbnail(url=owner.display_avatar.url)
+    embed.set_footer(text=f"VC ID: {channel.id}")
+    return embed
+
+
+async def disable_external_knock_panel(
+    bot: commands.Bot,
+    guild: discord.Guild,
+    row: sqlite3.Row,
+    *,
+    reason_text: str = "この部屋は終了しました",
+) -> None:
+    message_id = int(row["knock_message_id"]) if "knock_message_id" in row.keys() else 0
+    if not message_id:
+        return
+
+    panel_channel = get_text_channel(guild, KNOCK_PANEL_CHANNEL_ID)
+    if panel_channel is None:
+        return
+
+    try:
+        message = await panel_channel.fetch_message(message_id)
+        embed = message.embeds[0] if message.embeds else discord.Embed(title="🚪 ノック受付")
+        embed.color = discord.Color.dark_grey()
+        embed.set_footer(text=reason_text)
+        await message.edit(embed=embed, view=None)
+    except (discord.NotFound, discord.Forbidden):
+        pass
+    except discord.HTTPException:
+        log.exception("外部ノックパネル終了処理失敗: %s", message_id)
+
+
+class ExternalKnockDecisionView(discord.ui.View):
+    def __init__(self, channel_id: int, applicant_id: int):
+        super().__init__(timeout=15 * 60)
+        self.channel_id = channel_id
+        self.applicant_id = applicant_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        row = get_room(self.channel_id)
+        if row is None:
+            await interaction.response.send_message(
+                "部屋がすでに削除されています。",
+                ephemeral=True,
+            )
+            return False
+
+        member = interaction.user
+        allowed = (
+            interaction.user.id == int(row["owner_id"])
+            or (isinstance(member, discord.Member) and is_bot_admin(member))
+        )
+        if not allowed:
+            await interaction.response.send_message(
+                "部屋主または管理者だけ操作できます。",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="入室許可",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+    )
+    async def approve(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        row = get_room(self.channel_id)
+        guild = interaction.guild
+        channel = guild.get_channel(self.channel_id) if guild else None
+        applicant = guild.get_member(self.applicant_id) if guild else None
+
+        if row is None or not isinstance(channel, discord.VoiceChannel) or applicant is None:
+            await interaction.response.send_message(
+                "対象の部屋またはユーザーが見つかりません。",
+                ephemeral=True,
+            )
+            return
+
+        if is_blocked_either_way(int(row["owner_id"]), applicant.id):
+            await interaction.response.send_message(
+                "ブラックリスト関係のため許可できません。",
+                ephemeral=True,
+            )
+            return
+
+        await channel.set_permissions(
+            applicant,
+            view_channel=True,
+            connect=True,
+            speak=True,
+            stream=True,
+            use_voice_activation=True,
+            send_messages=True,
+            read_message_history=True,
+            use_application_commands=True,
+            reason="外部ノック承認",
+        )
+
+        try:
+            await applicant.send(
+                f"✅ **{guild.name}** の {channel.mention} へのノックが承認されました。"
+            )
+        except discord.HTTPException:
+            pass
+
+        await interaction.response.edit_message(
+            content=f"✅ {applicant.mention} の入室を許可しました。",
+            view=None,
+        )
+
+    @discord.ui.button(
+        label="お断り",
+        emoji="❌",
+        style=discord.ButtonStyle.danger,
+    )
+    async def reject(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        guild = interaction.guild
+        applicant = guild.get_member(self.applicant_id) if guild else None
+        if applicant:
+            try:
+                await applicant.send("今回はノックが見送られました。")
+            except discord.HTTPException:
+                pass
+
+        await interaction.response.edit_message(
+            content=f"❌ <@{self.applicant_id}> のノックをお断りしました。",
+            view=None,
+        )
+
+
+class ExternalKnockPanelView(discord.ui.View):
+    def __init__(self, channel_id: int):
+        super().__init__(timeout=None)
+        self.channel_id = channel_id
+
+        knock_button = discord.ui.Button(
+            label="ノックする",
+            emoji="🚪",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"noir:external_knock:{channel_id}",
+        )
+        knock_button.callback = self.knock
+        self.add_item(knock_button)
+
+    async def knock(self, interaction: discord.Interaction) -> None:
+        row = get_room(self.channel_id)
+        guild = interaction.guild
+        channel = guild.get_channel(self.channel_id) if guild else None
+
+        if row is None or not isinstance(channel, discord.VoiceChannel):
+            await interaction.response.send_message(
+                "この部屋はすでに終了しています。",
+                ephemeral=True,
+            )
+            return
+
+        owner_id = int(row["owner_id"])
+        if interaction.user.id == owner_id:
+            await interaction.response.send_message(
+                "部屋主本人はノック不要です。",
+                ephemeral=True,
+            )
+            return
+
+        if is_blocked_either_way(owner_id, interaction.user.id):
+            await interaction.response.send_message(
+                "ブラックリスト関係のためノックできません。",
+                ephemeral=True,
+            )
+            return
+
+        owner = guild.get_member(owner_id)
+        panel_channel = get_text_channel(guild, KNOCK_PANEL_CHANNEL_ID)
+        if panel_channel is None:
+            await interaction.response.send_message(
+                "ノック通知チャンネルが見つかりません。",
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(
+            title="🚪 ノックが届きました",
+            description=(
+                f"{interaction.user.mention} さんが\n"
+                f"{channel.mention} へノックしました。"
+            ),
+            color=discord.Color.gold(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+
+        await panel_channel.send(
+            content=owner.mention if owner else f"<@{owner_id}>",
+            embed=embed,
+            view=ExternalKnockDecisionView(channel.id, interaction.user.id),
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+
+        if owner:
+            try:
+                await owner.send(
+                    f"🚪 **{guild.name}** の {channel.name} に "
+                    f"{interaction.user} さんからノックが届きました。"
+                )
+            except discord.HTTPException:
+                pass
+
+        await interaction.response.send_message(
+            "🚪 ノックを送りました。入室許可をお待ちください。",
+            ephemeral=True,
+        )
+
+
+async def post_external_knock_panel(
+    channel: discord.VoiceChannel,
+    owner: discord.Member,
+    room_type: str,
+) -> None:
+    if "knock" not in room_type:
+        return
+
+    panel_channel = get_text_channel(channel.guild, KNOCK_PANEL_CHANNEL_ID)
+    if panel_channel is None:
+        log.error("ノックパネル投稿先が見つかりません: %s", KNOCK_PANEL_CHANNEL_ID)
+        return
+
+    message = await panel_channel.send(
+        embed=build_external_knock_embed(channel, owner, room_type),
+        view=ExternalKnockPanelView(channel.id),
+    )
+    set_knock_message_id(channel.id, message.id)
 
 
 # =========================================================
@@ -1137,7 +1431,7 @@ class VCMenuView(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="ノック",
+        label="ノック案内",
         emoji="🚪",
         style=discord.ButtonStyle.primary,
         custom_id="noir:vc:knock",
@@ -1163,32 +1457,16 @@ class VCMenuView(discord.ui.View):
             )
             return
 
-        owner_id = int(row["owner_id"])
-        if interaction.user.id == owner_id:
+        panel_channel = get_text_channel(channel.guild, KNOCK_PANEL_CHANNEL_ID)
+        if panel_channel is None:
             await interaction.response.send_message(
-                "作成者本人はノック不要です。",
+                "ノック受付チャンネルが見つかりません。",
                 ephemeral=True,
             )
             return
 
-        if is_blocked_either_way(owner_id, interaction.user.id):
-            await interaction.response.send_message(
-                "ブラックリスト関係のためノックできません。",
-                ephemeral=True,
-            )
-            return
-
-        owner = channel.guild.get_member(owner_id)
-        await channel.send(
-            content=(
-                f"{owner.mention if owner else f'<@{owner_id}>'}\n"
-                f"🚪 {interaction.user.mention} さんがノックしました！"
-            ),
-            view=KnockDecisionView(channel.id, interaction.user.id),
-            allowed_mentions=discord.AllowedMentions(users=True),
-        )
         await interaction.response.send_message(
-            "🚪 ノックを送りました。入室許可をお待ちください。",
+            f"🚪 ノックは {panel_channel.mention} の受付パネルから送れます。",
             ephemeral=True,
         )
 
@@ -1266,6 +1544,12 @@ class VCMenuView(discord.ui.View):
             ephemeral=True,
         )
         try:
+            await disable_external_knock_panel(
+                interaction.client,
+                channel.guild,
+                row,
+                reason_text="部屋主がこの部屋を終了しました",
+            )
             await channel.delete(reason=f"{interaction.user} がVCメニューから削除")
         finally:
             delete_room_record(channel.id)
@@ -1993,6 +2277,20 @@ class NoirBot(commands.Bot):
         self.add_view(QuickPanel())
         self.add_view(PrivatePanel())
         self.add_view(VCMenuView())
+
+        # 再起動後も既存の外部ノックパネルを使えるようにする
+        for row in all_rooms():
+            knock_message_id = (
+                int(row["knock_message_id"])
+                if "knock_message_id" in row.keys()
+                else 0
+            )
+            if knock_message_id:
+                self.add_view(
+                    ExternalKnockPanelView(int(row["channel_id"])),
+                    message_id=knock_message_id,
+                )
+
         self.add_view(NowPanel())
         self.add_view(FilterRecruitPanel())
         self.add_view(RecruitActionView())
@@ -2042,6 +2340,14 @@ class NoirBot(commands.Bot):
                 await asyncio.sleep(TIMED_ROOM_SECONDS)
                 current = channel.guild.get_channel(channel.id)
                 if isinstance(current, discord.VoiceChannel):
+                    row = get_room(current.id)
+                    if row:
+                        await disable_external_knock_panel(
+                            self,
+                            current.guild,
+                            row,
+                            reason_text="時間制限により部屋が終了しました",
+                        )
                     await current.delete(reason="時間制部屋の制限時間終了")
             except asyncio.CancelledError:
                 raise
@@ -2065,6 +2371,14 @@ class NoirBot(commands.Bot):
                 await asyncio.sleep(EMPTY_DELETE_SECONDS)
                 current = channel.guild.get_channel(channel.id)
                 if isinstance(current, discord.VoiceChannel) and not current.members:
+                    row = get_room(current.id)
+                    if row:
+                        await disable_external_knock_panel(
+                            self,
+                            current.guild,
+                            row,
+                            reason_text="空室のため部屋が終了しました",
+                        )
                     await current.delete(reason="空室になったため削除")
                     delete_room_record(channel.id)
             except asyncio.CancelledError:
@@ -2351,6 +2665,12 @@ async def room_delete(interaction: discord.Interaction, channel: discord.VoiceCh
         return
 
     await interaction.response.defer(ephemeral=True)
+    await disable_external_knock_panel(
+        interaction.client,
+        channel.guild,
+        row,
+        reason_text="部屋主または管理者がこの部屋を終了しました",
+    )
     await channel.delete(reason=f"{interaction.user} が削除")
     delete_room_record(channel.id)
     await interaction.followup.send("✅ 削除しました。", ephemeral=True)
