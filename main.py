@@ -368,6 +368,7 @@ class RoomSpec:
     timed: bool = False
     user_limit: int = 0
     opposite_gender_only: bool = False
+    public_connect: bool = False
 
 
 def clean_channel_name(text: str) -> str:
@@ -541,7 +542,13 @@ async def create_room(
     overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
         everyone: discord.PermissionOverwrite(
             view_channel=spec.public_view,
-            connect=False,
+            connect=spec.public_connect,
+            speak=spec.public_connect,
+            stream=spec.public_connect,
+            use_voice_activation=spec.public_connect,
+            send_messages=spec.public_view,
+            read_message_history=spec.public_view,
+            use_application_commands=spec.public_view,
         ),
         owner: discord.PermissionOverwrite(
             view_channel=True,
@@ -1775,6 +1782,152 @@ class QuickPanel(discord.ui.View):
         await self.open_select(interaction, "private_qm", "裏QMのタイプを選択してください。")
 
 
+
+# =========================================================
+# 公開エロイプ・ラジオ部屋
+# =========================================================
+
+async def create_public_special_room(
+    interaction: discord.Interaction,
+    *,
+    kind: str,
+    access_mode: str,
+) -> None:
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    guild = interaction.guild
+    owner = interaction.user
+    if guild is None or not isinstance(owner, discord.Member):
+        await interaction.followup.send(
+            "サーバー内で使用してください。",
+            ephemeral=True,
+        )
+        return
+
+    allowed_members: list[discord.Member] = []
+    public_connect = access_mode == "blacklist"
+
+    if access_mode == "mylist":
+        for user_id in get_pairs("favorites", owner.id):
+            member = guild.get_member(user_id)
+            if (
+                member
+                and not member.bot
+                and member.id != owner.id
+                and not is_blocked_either_way(owner.id, member.id)
+            ):
+                allowed_members.append(member)
+
+        if not allowed_members:
+            await interaction.followup.send(
+                "マイリストに登録されているメンバーがいません。\n"
+                "先に `/mylist_add` で登録してください。",
+                ephemeral=True,
+            )
+            return
+
+    if kind == "eroip":
+        title = "公開エロイプ"
+        emoji = "🔞"
+        room_type = f"public_eroip_{access_mode}"
+    else:
+        title = "ラジオ"
+        emoji = "📻"
+        room_type = f"radio_{access_mode}"
+
+    mode_label = "マイリスト" if access_mode == "mylist" else "ブラックリスト"
+    await create_room(
+        interaction,
+        RoomSpec(
+            name=f"{emoji}｜{title}｜{mode_label}｜{owner.display_name}",
+            category_id=QUICK_PUBLIC_CATEGORY_ID,
+            room_type=room_type,
+            public_view=True,
+            public_connect=public_connect,
+            user_limit=0,
+        ),
+        allowed_members=allowed_members,
+    )
+
+
+class PublicSpecialRoomPanel(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="マイリストで作成",
+        emoji="🐑",
+        style=discord.ButtonStyle.primary,
+        custom_id="noir:public_special:eroip:mylist",
+        row=0,
+    )
+    async def eroip_mylist(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await create_public_special_room(
+            interaction,
+            kind="eroip",
+            access_mode="mylist",
+        )
+
+    @discord.ui.button(
+        label="ブラックリストで作成",
+        emoji="🚫",
+        style=discord.ButtonStyle.secondary,
+        custom_id="noir:public_special:eroip:blacklist",
+        row=0,
+    )
+    async def eroip_blacklist(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await create_public_special_room(
+            interaction,
+            kind="eroip",
+            access_mode="blacklist",
+        )
+
+    @discord.ui.button(
+        label="マイリストで作成",
+        emoji="🐑",
+        style=discord.ButtonStyle.primary,
+        custom_id="noir:public_special:radio:mylist",
+        row=1,
+    )
+    async def radio_mylist(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await create_public_special_room(
+            interaction,
+            kind="radio",
+            access_mode="mylist",
+        )
+
+    @discord.ui.button(
+        label="ブラックリストで作成",
+        emoji="🚫",
+        style=discord.ButtonStyle.secondary,
+        custom_id="noir:public_special:radio:blacklist",
+        row=1,
+    )
+    async def radio_blacklist(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await create_public_special_room(
+            interaction,
+            kind="radio",
+            access_mode="blacklist",
+        )
+
+
+
 class PrivateUserSelect(discord.ui.UserSelect):
     def __init__(self, hidden: bool):
         self.hidden = hidden
@@ -2276,6 +2429,7 @@ class NoirBot(commands.Bot):
 
         self.add_view(QuickPanel())
         self.add_view(PrivatePanel())
+        self.add_view(PublicSpecialRoomPanel())
         self.add_view(VCMenuView())
 
         # 再起動後も既存の外部ノックパネルを使えるようにする
@@ -2558,6 +2712,81 @@ async def setup_recruitment_panels(interaction: discord.Interaction) -> None:
     )
     await channel.send(embed=embed, view=FilterRecruitPanel())
     await interaction.response.send_message("✅ 裏募集作成パネルを設置しました。", ephemeral=True)
+
+
+
+
+@bot.tree.command(
+    name="setup_public_room_panel",
+    description="公開エロイプ・ラジオ部屋の作成パネルを設置します",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def setup_public_room_panel(
+    interaction: discord.Interaction,
+    channel: Optional[discord.TextChannel] = None,
+) -> None:
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    if interaction.guild is None:
+        await interaction.followup.send(
+            "サーバー内で使用してください。",
+            ephemeral=True,
+        )
+        return
+
+    target = channel or interaction.channel
+    if not isinstance(target, discord.TextChannel):
+        await interaction.followup.send(
+            "テキストチャンネルを指定してください。",
+            ephemeral=True,
+        )
+        return
+
+    eroip_embed = discord.Embed(
+        title="🔞 公開エロイプ部屋作成",
+        description=(
+            "エロイプ公開をする部屋を作成します。\n"
+            "作成者のブラックリスト／マイリストが反映されます。\n\n"
+            "🐑 **マイリストで作成**\n"
+            "マイリスト登録者だけが接続できます。\n\n"
+            "🚫 **ブラックリストで作成**\n"
+            "公開部屋として作成し、ブラックリスト登録者は"
+            "閲覧・接続できません。"
+        ),
+        color=discord.Color.purple(),
+    )
+
+    radio_embed = discord.Embed(
+        title="📻 ラジオ部屋作成",
+        description=(
+            "歌・ゲーム・読み聞かせなどを配信できる公開部屋です。\n"
+            "作成者のブラックリスト／マイリストが反映されます。\n\n"
+            "🐑 **マイリストで作成**\n"
+            "マイリスト登録者だけが接続できます。\n\n"
+            "🚫 **ブラックリストで作成**\n"
+            "公開部屋として作成し、ブラックリスト登録者は"
+            "閲覧・接続できません。"
+        ),
+        color=discord.Color.light_grey(),
+    )
+
+    try:
+        await target.send(
+            embeds=[eroip_embed, radio_embed],
+            view=PublicSpecialRoomPanel(),
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        log.exception("公開部屋パネル設置失敗")
+        await interaction.followup.send(
+            "パネルを設置できませんでした。Botの権限を確認してください。",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(
+        f"✅ {target.mention} に公開部屋パネルを設置しました。",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="mylist_add", description="マイリストに追加")
