@@ -136,6 +136,27 @@ def init_db() -> None:
                 status TEXT NOT NULL DEFAULT 'pending',
                 created_at TEXT NOT NULL
             );
+
+
+            CREATE TABLE IF NOT EXISTS dm_settings (
+                guild_id INTEGER PRIMARY KEY,
+                panel_channel_id INTEGER NOT NULL,
+                dm_ng_role_id INTEGER NOT NULL DEFAULT 0,
+                dm_free_role_id INTEGER NOT NULL DEFAULT 0,
+                log_channel_id INTEGER NOT NULL DEFAULT 0,
+                panel_message_id INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS dm_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                requester_id INTEGER NOT NULL,
+                target_id INTEGER NOT NULL,
+                thread_id INTEGER NOT NULL DEFAULT 0,
+                decision_message_id INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL
+            );
             """
         )
 
@@ -196,6 +217,120 @@ def is_blocked_either_way(user_a: int, user_b: int) -> bool:
             (user_a, user_b, user_b, user_a),
         ).fetchone()
     return row is not None
+
+
+def save_dm_settings(
+    guild_id: int,
+    panel_channel_id: int,
+    dm_ng_role_id: int = 0,
+    dm_free_role_id: int = 0,
+    log_channel_id: int = 0,
+    panel_message_id: int = 0,
+) -> None:
+    with db_connect() as con:
+        con.execute(
+            """
+            INSERT INTO dm_settings(
+                guild_id, panel_channel_id, dm_ng_role_id,
+                dm_free_role_id, log_channel_id, panel_message_id
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                panel_channel_id=excluded.panel_channel_id,
+                dm_ng_role_id=excluded.dm_ng_role_id,
+                dm_free_role_id=excluded.dm_free_role_id,
+                log_channel_id=excluded.log_channel_id,
+                panel_message_id=excluded.panel_message_id
+            """,
+            (
+                guild_id,
+                panel_channel_id,
+                dm_ng_role_id,
+                dm_free_role_id,
+                log_channel_id,
+                panel_message_id,
+            ),
+        )
+
+
+def get_dm_settings(guild_id: int) -> Optional[sqlite3.Row]:
+    with db_connect() as con:
+        return con.execute(
+            "SELECT * FROM dm_settings WHERE guild_id=?",
+            (guild_id,),
+        ).fetchone()
+
+
+def create_dm_request_record(
+    guild_id: int,
+    requester_id: int,
+    target_id: int,
+) -> int:
+    with db_connect() as con:
+        cur = con.execute(
+            """
+            INSERT INTO dm_requests(
+                guild_id, requester_id, target_id, status, created_at
+            ) VALUES (?, ?, ?, 'pending', ?)
+            """,
+            (guild_id, requester_id, target_id, utc_now()),
+        )
+        return int(cur.lastrowid)
+
+
+def update_dm_request_location(
+    request_id: int,
+    thread_id: int,
+    decision_message_id: int,
+) -> None:
+    with db_connect() as con:
+        con.execute(
+            """
+            UPDATE dm_requests
+            SET thread_id=?, decision_message_id=?
+            WHERE id=?
+            """,
+            (thread_id, decision_message_id, request_id),
+        )
+
+
+def get_dm_request(request_id: int) -> Optional[sqlite3.Row]:
+    with db_connect() as con:
+        return con.execute(
+            "SELECT * FROM dm_requests WHERE id=?",
+            (request_id,),
+        ).fetchone()
+
+
+def set_dm_request_status(request_id: int, status: str) -> None:
+    with db_connect() as con:
+        con.execute(
+            "UPDATE dm_requests SET status=? WHERE id=?",
+            (status, request_id),
+        )
+
+
+def pending_dm_request_between(
+    guild_id: int,
+    requester_id: int,
+    target_id: int,
+) -> Optional[sqlite3.Row]:
+    with db_connect() as con:
+        return con.execute(
+            """
+            SELECT * FROM dm_requests
+            WHERE guild_id=? AND requester_id=? AND target_id=? AND status='pending'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (guild_id, requester_id, target_id),
+        ).fetchone()
+
+
+def all_pending_dm_requests() -> list[sqlite3.Row]:
+    with db_connect() as con:
+        return con.execute(
+            "SELECT * FROM dm_requests WHERE status='pending'"
+        ).fetchall()
 
 
 def save_room(
@@ -2404,6 +2539,377 @@ class RecruitActionView(discord.ui.View):
             await send_log(interaction.guild, f"🗑️ 募集取消：message={interaction.message.id}")
 
 
+
+# =========================================================
+# DM申請
+# =========================================================
+
+def member_has_role(member: discord.Member, role_id: int) -> bool:
+    if not role_id:
+        return False
+    return any(role.id == role_id for role in member.roles)
+
+
+async def send_dm_log(guild: discord.Guild, text: str) -> None:
+    settings = get_dm_settings(guild.id)
+    if not settings:
+        return
+    log_channel_id = int(settings["log_channel_id"])
+    if not log_channel_id:
+        return
+    channel = get_text_channel(guild, log_channel_id)
+    if channel is None:
+        return
+    try:
+        await channel.send(text)
+    except discord.HTTPException:
+        log.exception("DM申請ログ送信失敗")
+
+
+class DMDecisionView(discord.ui.View):
+    def __init__(self, request_id: int):
+        super().__init__(timeout=None)
+        self.request_id = request_id
+
+        approve = discord.ui.Button(
+            label="承認する",
+            emoji="✅",
+            style=discord.ButtonStyle.success,
+            custom_id=f"noir:dm_request:approve:{request_id}",
+        )
+        reject = discord.ui.Button(
+            label="お断り",
+            emoji="❌",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"noir:dm_request:reject:{request_id}",
+        )
+        approve.callback = self.approve
+        reject.callback = self.reject
+        self.add_item(approve)
+        self.add_item(reject)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        row = get_dm_request(self.request_id)
+        if row is None:
+            await interaction.response.send_message(
+                "このDM申請データは見つかりません。",
+                ephemeral=True,
+            )
+            return False
+
+        if row["status"] != "pending":
+            await interaction.response.send_message(
+                "このDM申請はすでに処理済みです。",
+                ephemeral=True,
+            )
+            return False
+
+        member = interaction.user
+        is_admin = (
+            isinstance(member, discord.Member)
+            and member.guild_permissions.administrator
+        )
+        if interaction.user.id != int(row["target_id"]) and not is_admin:
+            await interaction.response.send_message(
+                "申請された本人または管理者だけ操作できます。",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def approve(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        row = get_dm_request(self.request_id)
+        if row is None or row["status"] != "pending":
+            await interaction.followup.send(
+                "この申請はすでに処理済みです。",
+                ephemeral=True,
+            )
+            return
+
+        set_dm_request_status(self.request_id, "approved")
+
+        guild = interaction.guild
+        requester = guild.get_member(int(row["requester_id"])) if guild else None
+        target = guild.get_member(int(row["target_id"])) if guild else None
+
+        embed = discord.Embed(
+            title="✅ DM申請が承認されました",
+            description=(
+                f"{requester.mention if requester else f'<@{row['requester_id']}>'} さんの"
+                "DM申請が承認されました。\n\n"
+                "これ以降のDMは、お互いのルールと合意を守って利用してください。"
+            ),
+            color=discord.Color.green(),
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        if interaction.message:
+            try:
+                await interaction.message.edit(embed=embed, view=None)
+            except discord.HTTPException:
+                pass
+
+        if requester:
+            try:
+                await requester.send(
+                    f"✅ **{guild.name}** で {target.mention if target else '相手'} さんへの"
+                    "DM申請が承認されました。"
+                )
+            except discord.HTTPException:
+                pass
+
+        if guild:
+            await send_dm_log(
+                guild,
+                f"✅ DM申請承認｜申請者 <@{row['requester_id']}> → 相手 <@{row['target_id']}> "
+                f"｜request={self.request_id}",
+            )
+
+        await interaction.followup.send(
+            "✅ DM申請を承認しました。",
+            ephemeral=True,
+        )
+
+    async def reject(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        row = get_dm_request(self.request_id)
+        if row is None or row["status"] != "pending":
+            await interaction.followup.send(
+                "この申請はすでに処理済みです。",
+                ephemeral=True,
+            )
+            return
+
+        set_dm_request_status(self.request_id, "rejected")
+
+        guild = interaction.guild
+        requester = guild.get_member(int(row["requester_id"])) if guild else None
+
+        embed = discord.Embed(
+            title="❌ DM申請はお断りされました",
+            description="今回はDM申請が承認されませんでした。",
+            color=discord.Color.red(),
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        if interaction.message:
+            try:
+                await interaction.message.edit(embed=embed, view=None)
+            except discord.HTTPException:
+                pass
+
+        if requester:
+            try:
+                await requester.send(
+                    f"❌ **{guild.name}** でのDM申請は今回はお断りとなりました。"
+                )
+            except discord.HTTPException:
+                pass
+
+        if guild:
+            await send_dm_log(
+                guild,
+                f"❌ DM申請拒否｜申請者 <@{row['requester_id']}> → 相手 <@{row['target_id']}> "
+                f"｜request={self.request_id}",
+            )
+
+        await interaction.followup.send(
+            "❌ DM申請をお断りしました。",
+            ephemeral=True,
+        )
+
+        thread = interaction.channel
+        if isinstance(thread, discord.Thread):
+            try:
+                await thread.edit(archived=True, locked=True)
+            except discord.HTTPException:
+                pass
+
+
+class DMTargetSelect(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="DM申請する相手を選択してください",
+            min_values=1,
+            max_values=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        guild = interaction.guild
+        requester = interaction.user
+        if guild is None or not isinstance(requester, discord.Member):
+            await interaction.followup.send(
+                "サーバー内で使用してください。",
+                ephemeral=True,
+            )
+            return
+
+        selected = self.values[0]
+        target = guild.get_member(selected.id)
+        if target is None:
+            await interaction.followup.send(
+                "相手のメンバー情報を取得できませんでした。",
+                ephemeral=True,
+            )
+            return
+
+        if target.bot or target.id == requester.id:
+            await interaction.followup.send(
+                "自分自身またはBotには申請できません。",
+                ephemeral=True,
+            )
+            return
+
+        settings = get_dm_settings(guild.id)
+        if settings is None:
+            await interaction.followup.send(
+                "DM申請パネルの設定がありません。管理者に確認してください。",
+                ephemeral=True,
+            )
+            return
+
+        ng_role_id = int(settings["dm_ng_role_id"])
+        free_role_id = int(settings["dm_free_role_id"])
+
+        if member_has_role(target, ng_role_id):
+            await interaction.followup.send(
+                f"🚫 {target.mention} さんはDM申請を受け付けていません。",
+                ephemeral=True,
+            )
+            return
+
+        if member_has_role(target, free_role_id):
+            await interaction.followup.send(
+                f"⭕ {target.mention} さんは無断DM許可ロールを持っているため、"
+                "DM申請は不要です。",
+                ephemeral=True,
+            )
+            return
+
+        if is_blocked_either_way(requester.id, target.id):
+            await interaction.followup.send(
+                "ブラックリスト関係の相手にはDM申請できません。",
+                ephemeral=True,
+            )
+            return
+
+        if pending_dm_request_between(guild.id, requester.id, target.id):
+            await interaction.followup.send(
+                "この相手への未処理DM申請がすでにあります。",
+                ephemeral=True,
+            )
+            return
+
+        panel_channel = guild.get_channel(int(settings["panel_channel_id"]))
+        if not isinstance(panel_channel, discord.TextChannel):
+            await interaction.followup.send(
+                "DM申請チャンネルが見つかりません。管理者に確認してください。",
+                ephemeral=True,
+            )
+            return
+
+        request_id = create_dm_request_record(
+            guild.id,
+            requester.id,
+            target.id,
+        )
+
+        thread_name = (
+            f"dm申請-{requester.display_name}-{target.display_name}"
+        )[:95]
+
+        try:
+            thread = await panel_channel.create_thread(
+                name=thread_name,
+                type=discord.ChannelType.private_thread,
+                invitable=False,
+                auto_archive_duration=1440,
+                reason=f"DM申請: {requester} -> {target}",
+            )
+            await thread.add_user(requester)
+            await thread.add_user(target)
+
+            embed = discord.Embed(
+                title="🍜 DM申請",
+                description=(
+                    f"**申請者**：{requester.mention}\n"
+                    f"**申請先**：{target.mention}\n\n"
+                    "このスレッドで必要な確認を行ってください。\n"
+                    "申請先の方は、下のボタンから承認またはお断りを選択してください。"
+                ),
+                color=discord.Color.orange(),
+                timestamp=datetime.now(timezone.utc),
+            )
+            decision = await thread.send(
+                content=target.mention,
+                embed=embed,
+                view=DMDecisionView(request_id),
+                allowed_mentions=discord.AllowedMentions(
+                    users=True,
+                    roles=False,
+                    everyone=False,
+                ),
+            )
+            update_dm_request_location(
+                request_id,
+                thread.id,
+                decision.id,
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            log.exception("DM申請スレッド作成失敗")
+            set_dm_request_status(request_id, "failed")
+            await interaction.followup.send(
+                "DM申請スレッドを作成できませんでした。\n"
+                "Botに「プライベートスレッドを作成」「スレッドを管理」権限があるか確認してください。",
+                ephemeral=True,
+            )
+            return
+
+        await send_dm_log(
+            guild,
+            f"🍜 DM申請作成｜{requester.mention} → {target.mention}｜{thread.mention}",
+        )
+
+        await interaction.followup.send(
+            f"✅ {target.mention} さんとのDM申請スレッドを作成しました。\n"
+            f"{thread.mention}",
+            ephemeral=True,
+        )
+
+
+class DMTargetSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.add_item(DMTargetSelect())
+
+
+class DMRequestPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="申請する",
+        emoji="🍜",
+        style=discord.ButtonStyle.primary,
+        custom_id="noir:dm_request:start",
+    )
+    async def start(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await interaction.response.send_message(
+            "DM申請する相手を選択してください。",
+            ephemeral=True,
+            view=DMTargetSelectView(),
+        )
+
+
 # =========================================================
 # Bot
 # =========================================================
@@ -2430,7 +2936,16 @@ class NoirBot(commands.Bot):
         self.add_view(QuickPanel())
         self.add_view(PrivatePanel())
         self.add_view(PublicSpecialRoomPanel())
+        self.add_view(DMRequestPanel())
         self.add_view(VCMenuView())
+
+        # 再起動後も未処理DM申請の承認/拒否ボタンを復元
+        for dm_row in all_pending_dm_requests():
+            if int(dm_row["decision_message_id"]):
+                self.add_view(
+                    DMDecisionView(int(dm_row["id"])),
+                    message_id=int(dm_row["decision_message_id"]),
+                )
 
         # 再起動後も既存の外部ノックパネルを使えるようにする
         for row in all_rooms():
@@ -2785,6 +3300,85 @@ async def setup_public_room_panel(
 
     await interaction.followup.send(
         f"✅ {target.mention} に公開部屋パネルを設置しました。",
+        ephemeral=True,
+    )
+
+
+
+
+@bot.tree.command(
+    name="setup_dm_panel",
+    description="DM申請パネルを設置します",
+)
+@app_commands.describe(
+    channel="DM申請パネルを設置するチャンネル",
+    dm_ng_role="DM申請を受け付けない人用ロール（任意）",
+    dm_free_role="申請なしDMを許可する人用ロール（任意）",
+    log_channel="DM申請ログの送信先（任意）",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def setup_dm_panel(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    dm_ng_role: Optional[discord.Role] = None,
+    dm_free_role: Optional[discord.Role] = None,
+    log_channel: Optional[discord.TextChannel] = None,
+) -> None:
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.followup.send(
+            "サーバー内で使用してください。",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title="🍜 DM申請",
+        description=(
+            "【申請する】を押してユーザーを選択すると、"
+            "二人専用のプライベートスレッドが作成されます。\n"
+            "そのスレッド内で相手にDM申請を行ってください。\n\n"
+            + (
+                f"🚫 {dm_ng_role.mention} を持っている人には申請できません。\n"
+                if dm_ng_role else
+                "🚫 DM申請NGロールは未設定です。\n"
+            )
+            + (
+                f"⭕ {dm_free_role.mention} を持っている人は申請不要です。\n"
+                if dm_free_role else
+                "⭕ 無断DM許可ロールは未設定です。\n"
+            )
+            + "\nブラックリスト関係の相手には申請できません。"
+        ),
+        color=discord.Color.orange(),
+    )
+
+    try:
+        message = await channel.send(
+            embed=embed,
+            view=DMRequestPanel(),
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        log.exception("DM申請パネル設置失敗")
+        await interaction.followup.send(
+            "パネルを設置できませんでした。Botの権限を確認してください。",
+            ephemeral=True,
+        )
+        return
+
+    save_dm_settings(
+        guild.id,
+        channel.id,
+        dm_ng_role.id if dm_ng_role else 0,
+        dm_free_role.id if dm_free_role else 0,
+        log_channel.id if log_channel else 0,
+        message.id,
+    )
+
+    await interaction.followup.send(
+        f"✅ {channel.mention} にDM申請パネルを設置しました。",
         ephemeral=True,
     )
 
