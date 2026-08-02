@@ -137,6 +137,17 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS knock_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                owner_id INTEGER NOT NULL,
+                applicant_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                dm_message_id INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+
 
             CREATE TABLE IF NOT EXISTS dm_settings (
                 guild_id INTEGER PRIMARY KEY,
@@ -487,6 +498,74 @@ def update_application(application_id: int, status: str) -> None:
             "UPDATE applications SET status=? WHERE id=?",
             (status, application_id),
         )
+
+
+def all_pending_applications() -> list[sqlite3.Row]:
+    with db_connect() as con:
+        return con.execute(
+            "SELECT * FROM applications WHERE status='pending'"
+        ).fetchall()
+
+
+def create_knock_request(
+    guild_id: int,
+    channel_id: int,
+    owner_id: int,
+    applicant_id: int,
+) -> int:
+    with db_connect() as con:
+        old = con.execute(
+            """
+            SELECT id FROM knock_requests
+            WHERE channel_id=? AND applicant_id=? AND status='pending'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (channel_id, applicant_id),
+        ).fetchone()
+        if old:
+            return int(old["id"])
+
+        cur = con.execute(
+            """
+            INSERT INTO knock_requests(
+                guild_id, channel_id, owner_id, applicant_id,
+                status, dm_message_id, created_at
+            ) VALUES (?, ?, ?, ?, 'pending', 0, ?)
+            """,
+            (guild_id, channel_id, owner_id, applicant_id, utc_now()),
+        )
+        return int(cur.lastrowid)
+
+
+def get_knock_request(request_id: int) -> Optional[sqlite3.Row]:
+    with db_connect() as con:
+        return con.execute(
+            "SELECT * FROM knock_requests WHERE id=?",
+            (request_id,),
+        ).fetchone()
+
+
+def update_knock_request(request_id: int, status: str) -> None:
+    with db_connect() as con:
+        con.execute(
+            "UPDATE knock_requests SET status=? WHERE id=?",
+            (status, request_id),
+        )
+
+
+def set_knock_dm_message_id(request_id: int, message_id: int) -> None:
+    with db_connect() as con:
+        con.execute(
+            "UPDATE knock_requests SET dm_message_id=? WHERE id=?",
+            (message_id, request_id),
+        )
+
+
+def all_pending_knock_requests() -> list[sqlite3.Row]:
+    with db_connect() as con:
+        return con.execute(
+            "SELECT * FROM knock_requests WHERE status='pending'"
+        ).fetchall()
 
 
 # =========================================================
@@ -884,109 +963,198 @@ async def disable_external_knock_panel(
         log.exception("外部ノックパネル終了処理失敗: %s", message_id)
 
 
-class ExternalKnockDecisionView(discord.ui.View):
-    def __init__(self, channel_id: int, applicant_id: int):
-        super().__init__(timeout=15 * 60)
-        self.channel_id = channel_id
-        self.applicant_id = applicant_id
+class KnockDMDecisionView(discord.ui.View):
+    def __init__(self, request_id: int):
+        super().__init__(timeout=None)
+        self.request_id = request_id
+
+        approve = discord.ui.Button(
+            label="入室許可",
+            emoji="✅",
+            style=discord.ButtonStyle.success,
+            custom_id=f"noir:knock_dm:approve:{request_id}",
+        )
+        reject = discord.ui.Button(
+            label="お断り",
+            emoji="❌",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"noir:knock_dm:reject:{request_id}",
+        )
+        approve.callback = self.approve
+        reject.callback = self.reject
+        self.add_item(approve)
+        self.add_item(reject)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        row = get_room(self.channel_id)
-        if row is None:
+        req = get_knock_request(self.request_id)
+        if req is None:
             await interaction.response.send_message(
-                "部屋がすでに削除されています。",
+                "ノック情報が見つかりません。",
                 ephemeral=True,
             )
             return False
 
-        member = interaction.user
-        allowed = (
-            interaction.user.id == int(row["owner_id"])
-            or (isinstance(member, discord.Member) and is_bot_admin(member))
-        )
-        if not allowed:
+        if req["status"] != "pending":
             await interaction.response.send_message(
-                "部屋主または管理者だけ操作できます。",
+                "このノックはすでに処理済みです。",
+                ephemeral=True,
+            )
+            return False
+
+        if interaction.user.id != int(req["owner_id"]):
+            await interaction.response.send_message(
+                "部屋主だけ操作できます。",
                 ephemeral=True,
             )
             return False
         return True
 
-    @discord.ui.button(
-        label="入室許可",
-        emoji="✅",
-        style=discord.ButtonStyle.success,
-    )
-    async def approve(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button,
-    ) -> None:
-        row = get_room(self.channel_id)
-        guild = interaction.guild
-        channel = guild.get_channel(self.channel_id) if guild else None
-        applicant = guild.get_member(self.applicant_id) if guild else None
+    async def approve(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
 
-        if row is None or not isinstance(channel, discord.VoiceChannel) or applicant is None:
-            await interaction.response.send_message(
-                "対象の部屋またはユーザーが見つかりません。",
+        req = get_knock_request(self.request_id)
+        if req is None or req["status"] != "pending":
+            await interaction.followup.send(
+                "このノックはすでに処理済みです。",
                 ephemeral=True,
             )
             return
 
-        if is_blocked_either_way(int(row["owner_id"]), applicant.id):
-            await interaction.response.send_message(
+        guild = bot.get_guild(int(req["guild_id"]))
+        channel = (
+            guild.get_channel(int(req["channel_id"]))
+            if guild is not None
+            else None
+        )
+        applicant = (
+            guild.get_member(int(req["applicant_id"]))
+            if guild is not None
+            else None
+        )
+
+        if guild is None or not isinstance(channel, discord.VoiceChannel):
+            update_knock_request(self.request_id, "expired")
+            await interaction.followup.send(
+                "対象の部屋はすでに終了しています。",
+                ephemeral=True,
+            )
+            return
+
+        if applicant is None:
+            update_knock_request(self.request_id, "expired")
+            await interaction.followup.send(
+                "ノックしたメンバーが見つかりません。",
+                ephemeral=True,
+            )
+            return
+
+        if is_blocked_either_way(int(req["owner_id"]), applicant.id):
+            await interaction.followup.send(
                 "ブラックリスト関係のため許可できません。",
                 ephemeral=True,
             )
             return
 
-        await channel.set_permissions(
-            applicant,
-            view_channel=True,
-            connect=True,
-            speak=True,
-            stream=True,
-            use_voice_activation=True,
-            send_messages=True,
-            read_message_history=True,
-            use_application_commands=True,
-            reason="外部ノック承認",
-        )
+        try:
+            await channel.set_permissions(
+                applicant,
+                view_channel=True,
+                connect=True,
+                speak=True,
+                stream=True,
+                use_voice_activation=True,
+                send_messages=True,
+                read_message_history=True,
+                use_application_commands=True,
+                reason="DMからノック承認",
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            log.exception("ノック承認の権限付与失敗")
+            await interaction.followup.send(
+                "VCの入室権限を付与できませんでした。",
+                ephemeral=True,
+            )
+            return
+
+        update_knock_request(self.request_id, "approved")
 
         try:
             await applicant.send(
-                f"✅ **{guild.name}** の {channel.mention} へのノックが承認されました。"
+                f"✅ **{guild.name}** の **{channel.name}** へのノックが承認されました。\n"
+                f"サーバーに戻って {channel.mention} へ入室できます。"
             )
         except discord.HTTPException:
             pass
 
-        await interaction.response.edit_message(
-            content=f"✅ {applicant.mention} の入室を許可しました。",
-            view=None,
-        )
-
-    @discord.ui.button(
-        label="お断り",
-        emoji="❌",
-        style=discord.ButtonStyle.danger,
-    )
-    async def reject(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button,
-    ) -> None:
-        guild = interaction.guild
-        applicant = guild.get_member(self.applicant_id) if guild else None
-        if applicant:
+        if interaction.message:
             try:
-                await applicant.send("今回はノックが見送られました。")
+                embed = (
+                    interaction.message.embeds[0]
+                    if interaction.message.embeds
+                    else discord.Embed(title="🚪 ノックが届きました")
+                )
+                embed.color = discord.Color.green()
+                embed.add_field(
+                    name="結果",
+                    value=f"✅ 入室許可済み：{applicant}",
+                    inline=False,
+                )
+                await interaction.message.edit(embed=embed, view=None)
             except discord.HTTPException:
                 pass
 
-        await interaction.response.edit_message(
-            content=f"❌ <@{self.applicant_id}> のノックをお断りしました。",
-            view=None,
+        await interaction.followup.send(
+            "✅ 入室を許可しました。ノックした人にもDM通知しました。",
+            ephemeral=True,
+        )
+
+    async def reject(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        req = get_knock_request(self.request_id)
+        if req is None or req["status"] != "pending":
+            await interaction.followup.send(
+                "このノックはすでに処理済みです。",
+                ephemeral=True,
+            )
+            return
+
+        guild = bot.get_guild(int(req["guild_id"]))
+        applicant = (
+            guild.get_member(int(req["applicant_id"]))
+            if guild is not None
+            else None
+        )
+        update_knock_request(self.request_id, "rejected")
+
+        if applicant and guild:
+            try:
+                await applicant.send(
+                    f"❌ **{guild.name}** のノックは今回はお断りとなりました。"
+                )
+            except discord.HTTPException:
+                pass
+
+        if interaction.message:
+            try:
+                embed = (
+                    interaction.message.embeds[0]
+                    if interaction.message.embeds
+                    else discord.Embed(title="🚪 ノックが届きました")
+                )
+                embed.color = discord.Color.red()
+                embed.add_field(
+                    name="結果",
+                    value="❌ お断り済み",
+                    inline=False,
+                )
+                await interaction.message.edit(embed=embed, view=None)
+            except discord.HTTPException:
+                pass
+
+        await interaction.followup.send(
+            "❌ ノックをお断りしました。相手にもDM通知しました。",
+            ephemeral=True,
         )
 
 
@@ -1051,19 +1219,40 @@ class ExternalKnockPanelView(discord.ui.View):
         )
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
 
+        request_id = create_knock_request(
+            guild.id,
+            channel.id,
+            owner_id,
+            interaction.user.id,
+        )
+        decision_view = KnockDMDecisionView(request_id)
+
         await panel_channel.send(
             content=owner.mention if owner else f"<@{owner_id}>",
             embed=embed,
-            view=ExternalKnockDecisionView(channel.id, interaction.user.id),
+            view=decision_view,
             allowed_mentions=discord.AllowedMentions(users=True),
         )
 
         if owner:
             try:
-                await owner.send(
-                    f"🚪 **{guild.name}** の {channel.name} に "
-                    f"{interaction.user} さんからノックが届きました。"
+                dm_embed = discord.Embed(
+                    title="🚪 ノックが届きました",
+                    description=(
+                        f"**ノックした人**：{interaction.user.mention}\n"
+                        f"**ユーザー名**：{interaction.user}\n"
+                        f"**部屋**：{channel.name}\n\n"
+                        "下のボタンから入室許可またはお断りを選択できます。"
+                    ),
+                    color=discord.Color.gold(),
+                    timestamp=datetime.now(timezone.utc),
                 )
+                dm_embed.set_thumbnail(url=interaction.user.display_avatar.url)
+                dm_message = await owner.send(
+                    embed=dm_embed,
+                    view=KnockDMDecisionView(request_id),
+                )
+                set_knock_dm_message_id(request_id, dm_message.id)
             except discord.HTTPException:
                 pass
 
@@ -2343,30 +2532,59 @@ class ApplicationDecisionView(discord.ui.View):
         self.add_item(approve)
         self.add_item(reject)
 
+    def _guild(self) -> Optional[discord.Guild]:
+        return bot.get_guild(GUILD_ID)
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         row = get_application(self.application_id)
         if row is None:
-            await interaction.response.send_message("応募情報が見つかりません。", ephemeral=True)
+            await interaction.response.send_message(
+                "応募情報が見つかりません。",
+                ephemeral=True,
+            )
             return False
+
+        if row["status"] != "pending":
+            await interaction.response.send_message(
+                "この応募はすでに処理済みです。",
+                ephemeral=True,
+            )
+            return False
+
         if interaction.user.id != int(row["owner_id"]):
-            await interaction.response.send_message("募集主だけ操作できます。", ephemeral=True)
+            await interaction.response.send_message(
+                "募集主だけ操作できます。",
+                ephemeral=True,
+            )
             return False
         return True
 
     async def approve(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+
         row = get_application(self.application_id)
         if row is None or row["status"] != "pending":
-            await interaction.response.send_message("この応募は処理済みです。", ephemeral=True)
+            await interaction.followup.send(
+                "この応募はすでに処理済みです。",
+                ephemeral=True,
+            )
             return
 
-        guild = interaction.guild
+        guild = self._guild()
         if guild is None:
+            await interaction.followup.send(
+                "サーバー情報を取得できませんでした。",
+                ephemeral=True,
+            )
             return
 
         owner = guild.get_member(int(row["owner_id"]))
         applicant = guild.get_member(int(row["applicant_id"]))
         if owner is None or applicant is None:
-            await interaction.response.send_message("ユーザーが見つかりません。", ephemeral=True)
+            await interaction.followup.send(
+                "募集主または応募者がサーバーに見つかりません。",
+                ephemeral=True,
+            )
             return
 
         update_application(self.application_id, "approved")
@@ -2376,51 +2594,113 @@ class ApplicationDecisionView(discord.ui.View):
         if parent:
             try:
                 thread = await parent.create_thread(
-                    name=clean_channel_name(f"連絡用｜{owner.display_name}×{applicant.display_name}"),
+                    name=clean_channel_name(
+                        f"連絡用｜{owner.display_name}×{applicant.display_name}"
+                    ),
                     type=discord.ChannelType.private_thread,
+                    invitable=False,
+                    auto_archive_duration=1440,
                     reason="募集応募が承認されたため",
                 )
                 await thread.add_user(owner)
                 await thread.add_user(applicant)
                 await thread.send(
                     f"{owner.mention} {applicant.mention}\n"
-                    "応募が承認されました。このスレッドで連絡してください。"
+                    "✅ 応募が承認されました。このスレッドで連絡してください。"
                 )
                 thread_text = f"\n連絡用スレッド：{thread.mention}"
             except Exception:
                 log.exception("連絡用スレッド作成失敗")
 
         try:
-            await applicant.send(f"✅ {guild.name} の募集への応募が承認されました。{thread_text}")
+            await applicant.send(
+                f"✅ **{guild.name}** の募集への立候補が承認されました。"
+                f"{thread_text}"
+            )
         except discord.HTTPException:
             pass
 
-        await send_log(guild, f"✅ 応募承認：募集主 {owner.mention} / 応募者 {applicant.mention}")
-        await interaction.response.edit_message(
-            content=(interaction.message.content or "") + f"\n\n✅ 承認済み：{applicant.mention}{thread_text}",
-            view=None,
+        await send_log(
+            guild,
+            f"✅ 応募承認：募集主 {owner.mention} / 応募者 {applicant.mention}",
+        )
+
+        if interaction.message:
+            try:
+                embed = (
+                    interaction.message.embeds[0]
+                    if interaction.message.embeds
+                    else discord.Embed(title="💞 募集への立候補")
+                )
+                embed.color = discord.Color.green()
+                embed.add_field(
+                    name="結果",
+                    value=f"✅ 承認済み\n応募者：{applicant.mention}{thread_text}",
+                    inline=False,
+                )
+                await interaction.message.edit(embed=embed, view=None)
+            except discord.HTTPException:
+                pass
+
+        await interaction.followup.send(
+            "✅ 立候補を承認しました。応募者にもDMで通知しました。",
+            ephemeral=True,
         )
 
     async def reject(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+
         row = get_application(self.application_id)
         if row is None or row["status"] != "pending":
-            await interaction.response.send_message("この応募は処理済みです。", ephemeral=True)
+            await interaction.followup.send(
+                "この応募はすでに処理済みです。",
+                ephemeral=True,
+            )
             return
 
+        guild = self._guild()
         update_application(self.application_id, "rejected")
-        guild = interaction.guild
-        if guild:
-            applicant = guild.get_member(int(row["applicant_id"]))
-            if applicant:
-                try:
-                    await applicant.send(f"今回は募集への応募が見送られました。")
-                except discord.HTTPException:
-                    pass
-            await send_log(guild, f"❌ 応募却下：application={self.application_id}")
 
-        await interaction.response.edit_message(
-            content=(interaction.message.content or "") + "\n\n❌ お断り済み",
-            view=None,
+        applicant = (
+            guild.get_member(int(row["applicant_id"]))
+            if guild is not None
+            else None
+        )
+        if applicant and guild:
+            try:
+                await applicant.send(
+                    f"❌ **{guild.name}** の募集への立候補は今回は見送られました。"
+                )
+            except discord.HTTPException:
+                pass
+
+        if guild:
+            await send_log(
+                guild,
+                f"❌ 応募却下：募集主 <@{row['owner_id']}> / "
+                f"応募者 <@{row['applicant_id']}>",
+            )
+
+        if interaction.message:
+            try:
+                embed = (
+                    interaction.message.embeds[0]
+                    if interaction.message.embeds
+                    else discord.Embed(title="💞 募集への立候補")
+                )
+                embed.color = discord.Color.red()
+                embed.add_field(
+                    name="結果",
+                    value="❌ お断り済み",
+                    inline=False,
+                )
+                await interaction.message.edit(embed=embed, view=None)
+            except discord.HTTPException:
+                pass
+
+        await interaction.followup.send(
+            "❌ 立候補をお断りしました。応募者にもDMで通知しました。",
+            ephemeral=True,
         )
 
 
@@ -2488,10 +2768,25 @@ class RecruitActionView(discord.ui.View):
 
         if owner:
             try:
+                dm_embed = discord.Embed(
+                    title="💞 募集への立候補",
+                    description=(
+                        f"**応募者**：{interaction.user.mention}\n"
+                        f"**応募者名**：{interaction.user}\n\n"
+                        "下のボタンから承認またはお断りを選択できます。"
+                    ),
+                    color=discord.Color.pink(),
+                    timestamp=datetime.now(timezone.utc),
+                )
+                dm_embed.add_field(
+                    name="元の募集",
+                    value=interaction.message.jump_url,
+                    inline=False,
+                )
+                dm_embed.set_thumbnail(url=interaction.user.display_avatar.url)
                 await owner.send(
-                    f"💞 {interaction.guild.name} で立候補が届きました。\n"
-                    f"応募者：{interaction.user} ({interaction.user.id})\n"
-                    f"募集：{interaction.message.jump_url}"
+                    embed=dm_embed,
+                    view=ApplicationDecisionView(application_id),
                 )
             except discord.HTTPException:
                 pass
@@ -2946,6 +3241,18 @@ class NoirBot(commands.Bot):
                     DMDecisionView(int(dm_row["id"])),
                     message_id=int(dm_row["decision_message_id"]),
                 )
+
+        # 再起動後も募集立候補のDM承認/拒否ボタンを復元
+        for app_row in all_pending_applications():
+            self.add_view(
+                ApplicationDecisionView(int(app_row["id"]))
+            )
+
+        # 再起動後もノックDMの承認/拒否ボタンを復元
+        for knock_row in all_pending_knock_requests():
+            self.add_view(
+                KnockDMDecisionView(int(knock_row["id"]))
+            )
 
         # 再起動後も既存の外部ノックパネルを使えるようにする
         for row in all_rooms():
