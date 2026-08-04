@@ -41,6 +41,7 @@ FEMALE_NOTIFY_ROLE_ID = 1523690396515962981
 # プロフィール審査
 PROFILE_REVIEW_ROLE_ID = 1534024183233777706
 TEMP_PROFILE_CHANNEL_ID = 1534024845799460964
+PROFILE_REVIEW_CHANNEL_ID = 1534029103928184952
 VERIFIED_ROLE_ID = 1482298544877736058
 
 # 裏募集
@@ -3290,8 +3291,23 @@ async def handle_temp_profile_message(message: discord.Message) -> None:
     )
     embed.set_thumbnail(url=message.author.display_avatar.url)
 
+    review_channel = get_text_channel(message.guild, PROFILE_REVIEW_CHANNEL_ID)
+    if review_channel is None:
+        log.error(
+            "プロフィール審査管理チャンネルが見つかりません: %s",
+            PROFILE_REVIEW_CHANNEL_ID,
+        )
+        try:
+            await message.author.send(
+                "⚠️ プロフィールは受け付けましたが、審査管理チャンネルが見つからないため"
+                "管理者へ送信できませんでした。管理者へご連絡ください。"
+            )
+        except discord.HTTPException:
+            pass
+        return
+
     try:
-        review_message = await message.channel.send(
+        review_message = await review_channel.send(
             content=review_role.mention if review_role else None,
             embed=embed,
             view=ProfileReviewView(review_id),
@@ -3302,8 +3318,16 @@ async def handle_temp_profile_message(message: discord.Message) -> None:
             ),
         )
         set_profile_review_message(review_id, review_message.id)
+
+        try:
+            await message.author.send(
+                f"📋 **{message.guild.name}** の仮プロフィールを受け付けました。\n"
+                "現在、管理者による審査待ちです。結果はBotからDMでお知らせします。"
+            )
+        except discord.HTTPException:
+            pass
     except discord.HTTPException:
-        log.exception("プロフィール審査パネル投稿失敗")
+        log.exception("プロフィール審査管理チャンネルへの投稿失敗")
 
 
 # =========================================================
