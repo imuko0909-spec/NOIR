@@ -38,6 +38,11 @@ FEMALE_PROFILE_CHANNEL_ID = 1482301192263569522
 MALE_NOTIFY_ROLE_ID = 1482301549353897984
 FEMALE_NOTIFY_ROLE_ID = 1523690396515962981
 
+# プロフィール審査
+PROFILE_REVIEW_ROLE_ID = 1534024183233777706
+TEMP_PROFILE_CHANNEL_ID = 1534024845799460964
+VERIFIED_ROLE_ID = 1482298544877736058
+
 # 裏募集
 RECRUIT_CREATE_PANEL_CHANNEL_ID = 1524090558518132907
 RECRUIT_CONFIRM_CHANNEL_ID = 1529514190497386606
@@ -148,6 +153,18 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             );
 
+
+            CREATE TABLE IF NOT EXISTS profile_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                source_message_id INTEGER NOT NULL UNIQUE,
+                member_id INTEGER NOT NULL,
+                profile_text TEXT NOT NULL,
+                gender TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                review_message_id INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS dm_settings (
                 guild_id INTEGER PRIMARY KEY,
@@ -566,6 +583,101 @@ def all_pending_knock_requests() -> list[sqlite3.Row]:
         return con.execute(
             "SELECT * FROM knock_requests WHERE status='pending'"
         ).fetchall()
+
+
+
+def create_profile_review(
+    guild_id: int,
+    source_message_id: int,
+    member_id: int,
+    profile_text: str,
+    gender: str,
+) -> int:
+    with db_connect() as con:
+        old = con.execute(
+            "SELECT id FROM profile_reviews WHERE source_message_id=?",
+            (source_message_id,),
+        ).fetchone()
+        if old:
+            return int(old["id"])
+
+        cur = con.execute(
+            """
+            INSERT INTO profile_reviews(
+                guild_id, source_message_id, member_id,
+                profile_text, gender, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+            """,
+            (
+                guild_id,
+                source_message_id,
+                member_id,
+                profile_text,
+                gender,
+                utc_now(),
+            ),
+        )
+        return int(cur.lastrowid)
+
+
+def get_profile_review(review_id: int) -> Optional[sqlite3.Row]:
+    with db_connect() as con:
+        return con.execute(
+            "SELECT * FROM profile_reviews WHERE id=?",
+            (review_id,),
+        ).fetchone()
+
+
+def update_profile_review(review_id: int, status: str) -> None:
+    with db_connect() as con:
+        con.execute(
+            "UPDATE profile_reviews SET status=? WHERE id=?",
+            (status, review_id),
+        )
+
+
+def set_profile_review_message(review_id: int, message_id: int) -> None:
+    with db_connect() as con:
+        con.execute(
+            "UPDATE profile_reviews SET review_message_id=? WHERE id=?",
+            (message_id, review_id),
+        )
+
+
+def all_pending_profile_reviews() -> list[sqlite3.Row]:
+    with db_connect() as con:
+        return con.execute(
+            "SELECT * FROM profile_reviews WHERE status='pending'"
+        ).fetchall()
+
+
+def detect_profile_gender(profile_text: str) -> str:
+    import re
+
+    match = re.search(
+        r"【性別/年齢】[ \t]*([^\n\r]*)",
+        profile_text,
+        flags=re.IGNORECASE,
+    )
+    value = match.group(1).strip() if match else ""
+
+    if not value:
+        lines = profile_text.splitlines()
+        for i, line in enumerate(lines):
+            if "【性別/年齢】" in line:
+                remainder = line.split("【性別/年齢】", 1)[1].strip()
+                if remainder:
+                    value = remainder
+                elif i + 1 < len(lines):
+                    value = lines[i + 1].strip()
+                break
+
+    lowered = value.lower()
+    if "女性" in value or value.startswith("女") or "female" in lowered:
+        return "female"
+    if "男性" in value or value.startswith("男") or "male" in lowered:
+        return "male"
+    return ""
 
 
 # =========================================================
@@ -2835,6 +2947,365 @@ class RecruitActionView(discord.ui.View):
 
 
 
+
+# =========================================================
+# プロフィール審査
+# =========================================================
+
+PROFILE_TEMPLATE_FIELDS = (
+    "【名前】",
+    "【性別/年齢】",
+    "【住まい】",
+    "【主な出没時間】",
+    "【個室のプレイスタイル】",
+    "【通話の可否】",
+    "【フェチ・好きな属性】",
+    "【嫌いなタイプ・NG行為】",
+    "【自分の取扱説明書】",
+    "【最後に】",
+)
+
+
+def missing_profile_fields(profile_text: str) -> list[str]:
+    return [field for field in PROFILE_TEMPLATE_FIELDS if field not in profile_text]
+
+
+class ProfileReviewView(discord.ui.View):
+    def __init__(self, review_id: int):
+        super().__init__(timeout=None)
+        self.review_id = review_id
+
+        approve = discord.ui.Button(
+            label="合格",
+            emoji="✅",
+            style=discord.ButtonStyle.success,
+            custom_id=f"noir:profile_review:approve:{review_id}",
+        )
+        reject = discord.ui.Button(
+            label="不合格",
+            emoji="❌",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"noir:profile_review:reject:{review_id}",
+        )
+        approve.callback = self.approve
+        reject.callback = self.reject
+        self.add_item(approve)
+        self.add_item(reject)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        row = get_profile_review(self.review_id)
+        if row is None:
+            await interaction.response.send_message(
+                "審査データが見つかりません。",
+                ephemeral=True,
+            )
+            return False
+
+        if row["status"] != "pending":
+            await interaction.response.send_message(
+                "このプロフィールはすでに審査済みです。",
+                ephemeral=True,
+            )
+            return False
+
+        member = interaction.user
+        allowed = (
+            isinstance(member, discord.Member)
+            and (
+                member.guild_permissions.administrator
+                or member.get_role(PROFILE_REVIEW_ROLE_ID) is not None
+            )
+        )
+        if not allowed:
+            await interaction.response.send_message(
+                "審査ロールを持っている人だけ操作できます。",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def approve(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        row = get_profile_review(self.review_id)
+        if row is None or row["status"] != "pending":
+            await interaction.followup.send(
+                "このプロフィールはすでに審査済みです。",
+                ephemeral=True,
+            )
+            return
+
+        guild = bot.get_guild(int(row["guild_id"]))
+        if guild is None:
+            await interaction.followup.send(
+                "サーバー情報を取得できません。",
+                ephemeral=True,
+            )
+            return
+
+        member = guild.get_member(int(row["member_id"]))
+        if member is None:
+            update_profile_review(self.review_id, "member_missing")
+            await interaction.followup.send(
+                "投稿者がサーバーに見つかりません。",
+                ephemeral=True,
+            )
+            return
+
+        gender = str(row["gender"])
+        if gender not in {"male", "female"}:
+            await interaction.followup.send(
+                "【性別/年齢】から男性・女性を判定できません。\n"
+                "投稿者にプロフィールを修正してもらってください。",
+                ephemeral=True,
+            )
+            return
+
+        verified_role = guild.get_role(VERIFIED_ROLE_ID)
+        male_role = guild.get_role(MALE_ROLE_ID)
+        female_role = guild.get_role(FEMALE_ROLE_ID)
+
+        target_role = male_role if gender == "male" else female_role
+        opposite_role = female_role if gender == "male" else male_role
+
+        if verified_role is None or target_role is None:
+            await interaction.followup.send(
+                "確認ロールまたは性別ロールが見つかりません。",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            roles_to_add = [verified_role, target_role]
+            await member.add_roles(
+                *roles_to_add,
+                reason=f"プロフィール審査合格 / reviewer={interaction.user}",
+            )
+            if opposite_role and opposite_role in member.roles:
+                await member.remove_roles(
+                    opposite_role,
+                    reason="プロフィール審査で性別ロールを整理",
+                )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "ロールを付与できませんでした。\n"
+                "NOIRbotのロールを、確認・男性・女性ロールより上に置いてください。",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException:
+            log.exception("プロフィール合格ロール付与失敗")
+            await interaction.followup.send(
+                "ロール付与中にDiscordエラーが発生しました。",
+                ephemeral=True,
+            )
+            return
+
+        destination_id = (
+            MALE_PROFILE_CHANNEL_ID
+            if gender == "male"
+            else FEMALE_PROFILE_CHANNEL_ID
+        )
+        destination = get_text_channel(guild, destination_id)
+
+        profile_jump = ""
+        if destination:
+            try:
+                profile_embed = discord.Embed(
+                    title=f"🌙 {member.display_name}｜PROFILE",
+                    description=str(row["profile_text"])[:4096],
+                    color=discord.Color.blurple(),
+                    timestamp=datetime.now(timezone.utc),
+                )
+                profile_embed.set_author(
+                    name=str(member),
+                    icon_url=member.display_avatar.url,
+                )
+                profile_embed.set_footer(text=f"User ID: {member.id}")
+                posted = await destination.send(
+                    content=member.mention,
+                    embed=profile_embed,
+                    allowed_mentions=discord.AllowedMentions(
+                        users=True,
+                        roles=False,
+                        everyone=False,
+                    ),
+                )
+                profile_jump = posted.jump_url
+            except discord.HTTPException:
+                log.exception("正式プロフィール投稿失敗")
+        else:
+            log.error("正式プロフィールチャンネルが見つかりません: %s", destination_id)
+
+        update_profile_review(self.review_id, "approved")
+
+        try:
+            dm_text = (
+                f"✅ **{guild.name}** のプロフィール審査に合格しました！\n"
+                f"確認ロールと{'男性' if gender == 'male' else '女性'}ロールを付与しました。"
+            )
+            if profile_jump:
+                dm_text += f"\n\n正式プロフィール：{profile_jump}"
+            await member.send(dm_text)
+        except discord.HTTPException:
+            pass
+
+        if interaction.message:
+            try:
+                embed = (
+                    interaction.message.embeds[0]
+                    if interaction.message.embeds
+                    else discord.Embed(title="📋 プロフィール審査")
+                )
+                embed.color = discord.Color.green()
+                embed.add_field(
+                    name="審査結果",
+                    value=(
+                        f"✅ 合格\n"
+                        f"審査担当：{interaction.user.mention}\n"
+                        f"付与：{verified_role.mention} / {target_role.mention}"
+                    ),
+                    inline=False,
+                )
+                await interaction.message.edit(embed=embed, view=None)
+            except discord.HTTPException:
+                pass
+
+        await interaction.followup.send(
+            "✅ 合格処理が完了しました。本人にもDMを送りました。",
+            ephemeral=True,
+        )
+
+    async def reject(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        row = get_profile_review(self.review_id)
+        if row is None or row["status"] != "pending":
+            await interaction.followup.send(
+                "このプロフィールはすでに審査済みです。",
+                ephemeral=True,
+            )
+            return
+
+        guild = bot.get_guild(int(row["guild_id"]))
+        member = (
+            guild.get_member(int(row["member_id"]))
+            if guild is not None
+            else None
+        )
+
+        update_profile_review(self.review_id, "rejected")
+
+        if member and guild:
+            try:
+                await member.send(
+                    f"❌ **{guild.name}** のプロフィール審査は今回は不合格となりました。\n"
+                    "内容を確認・修正して、必要であれば再度プロフィールを投稿してください。"
+                )
+            except discord.HTTPException:
+                pass
+
+        if interaction.message:
+            try:
+                embed = (
+                    interaction.message.embeds[0]
+                    if interaction.message.embeds
+                    else discord.Embed(title="📋 プロフィール審査")
+                )
+                embed.color = discord.Color.red()
+                embed.add_field(
+                    name="審査結果",
+                    value=f"❌ 不合格\n審査担当：{interaction.user.mention}",
+                    inline=False,
+                )
+                await interaction.message.edit(embed=embed, view=None)
+            except discord.HTTPException:
+                pass
+
+        await interaction.followup.send(
+            "❌ 不合格処理が完了しました。本人にもDMを送りました。",
+            ephemeral=True,
+        )
+
+
+async def handle_temp_profile_message(message: discord.Message) -> None:
+    if message.author.bot or message.guild is None:
+        return
+    if message.channel.id != TEMP_PROFILE_CHANNEL_ID:
+        return
+    if not isinstance(message.author, discord.Member):
+        return
+
+    profile_text = message.content.strip()
+    if not profile_text:
+        return
+
+    missing = missing_profile_fields(profile_text)
+    gender = detect_profile_gender(profile_text)
+
+    review_id = create_profile_review(
+        message.guild.id,
+        message.id,
+        message.author.id,
+        profile_text,
+        gender,
+    )
+
+    review_role = message.guild.get_role(PROFILE_REVIEW_ROLE_ID)
+    gender_text = (
+        "男性" if gender == "male"
+        else "女性" if gender == "female"
+        else "⚠️ 判定できません"
+    )
+
+    embed = discord.Embed(
+        title="📋 仮プロフィール審査",
+        description=profile_text[:4096],
+        color=discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(
+        name="投稿者",
+        value=f"{message.author.mention} (`{message.author.id}`)",
+        inline=False,
+    )
+    embed.add_field(
+        name="性別判定",
+        value=gender_text,
+        inline=True,
+    )
+    embed.add_field(
+        name="テンプレ確認",
+        value=(
+            "✅ 全項目あり"
+            if not missing
+            else "⚠️ 不足：" + "、".join(missing)
+        )[:1024],
+        inline=False,
+    )
+    embed.add_field(
+        name="元の投稿",
+        value=message.jump_url,
+        inline=False,
+    )
+    embed.set_thumbnail(url=message.author.display_avatar.url)
+
+    try:
+        review_message = await message.channel.send(
+            content=review_role.mention if review_role else None,
+            embed=embed,
+            view=ProfileReviewView(review_id),
+            allowed_mentions=discord.AllowedMentions(
+                roles=True,
+                users=False,
+                everyone=False,
+            ),
+        )
+        set_profile_review_message(review_id, review_message.id)
+    except discord.HTTPException:
+        log.exception("プロフィール審査パネル投稿失敗")
+
+
 # =========================================================
 # DM申請
 # =========================================================
@@ -3213,6 +3684,7 @@ intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
 intents.voice_states = True
+intents.message_content = True
 
 
 class NoirBot(commands.Bot):
@@ -3233,6 +3705,15 @@ class NoirBot(commands.Bot):
         self.add_view(PublicSpecialRoomPanel())
         self.add_view(DMRequestPanel())
         self.add_view(VCMenuView())
+
+        # 再起動後も未処理プロフィール審査ボタンを復元
+        for profile_row in all_pending_profile_reviews():
+            review_message_id = int(profile_row["review_message_id"])
+            if review_message_id:
+                self.add_view(
+                    ProfileReviewView(int(profile_row["id"])),
+                    message_id=review_message_id,
+                )
 
         # 再起動後も未処理DM申請の承認/拒否ボタンを復元
         for dm_row in all_pending_dm_requests():
@@ -3388,6 +3869,10 @@ class NoirBot(commands.Bot):
                 stream=True,
                 use_voice_activation=True,
             )
+
+    async def on_message(self, message: discord.Message) -> None:
+        await handle_temp_profile_message(message)
+        await self.process_commands(message)
 
     async def on_voice_state_update(
         self,
