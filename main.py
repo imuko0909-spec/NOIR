@@ -155,6 +155,14 @@ def init_db() -> None:
             );
 
 
+            CREATE TABLE IF NOT EXISTS yuri_bl_settings (
+                guild_id INTEGER PRIMARY KEY,
+                panel_channel_id INTEGER NOT NULL,
+                yuri_category_id INTEGER NOT NULL,
+                bl_category_id INTEGER NOT NULL,
+                panel_message_id INTEGER NOT NULL DEFAULT 0
+            );
+
             CREATE TABLE IF NOT EXISTS profile_reviews (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id INTEGER NOT NULL,
@@ -679,6 +687,46 @@ def detect_profile_gender(profile_text: str) -> str:
     if "男性" in value or value.startswith("男") or "male" in lowered:
         return "male"
     return ""
+
+
+
+def save_yuri_bl_settings(
+    guild_id: int,
+    panel_channel_id: int,
+    yuri_category_id: int,
+    bl_category_id: int,
+    panel_message_id: int = 0,
+) -> None:
+    with db_connect() as con:
+        con.execute(
+            """
+            INSERT INTO yuri_bl_settings(
+                guild_id, panel_channel_id,
+                yuri_category_id, bl_category_id,
+                panel_message_id
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                panel_channel_id=excluded.panel_channel_id,
+                yuri_category_id=excluded.yuri_category_id,
+                bl_category_id=excluded.bl_category_id,
+                panel_message_id=excluded.panel_message_id
+            """,
+            (
+                guild_id,
+                panel_channel_id,
+                yuri_category_id,
+                bl_category_id,
+                panel_message_id,
+            ),
+        )
+
+
+def get_yuri_bl_settings(guild_id: int) -> Optional[sqlite3.Row]:
+    with db_connect() as con:
+        return con.execute(
+            "SELECT * FROM yuri_bl_settings WHERE guild_id=?",
+            (guild_id,),
+        ).fetchone()
 
 
 # =========================================================
@@ -2220,6 +2268,176 @@ class QuickPanel(discord.ui.View):
 
 
 
+
+# =========================================================
+# 百合・BL専用部屋
+# =========================================================
+
+async def create_yuri_bl_room(
+    interaction: discord.Interaction,
+    room_kind: str,
+) -> None:
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    guild = interaction.guild
+    owner = interaction.user
+    if guild is None or not isinstance(owner, discord.Member):
+        await interaction.followup.send(
+            "サーバー内で使用してください。",
+            ephemeral=True,
+        )
+        return
+
+    settings = get_yuri_bl_settings(guild.id)
+    if settings is None:
+        await interaction.followup.send(
+            "百合・BL部屋の設定がありません。管理者が `/setup_yuri_bl_panel` を実行してください。",
+            ephemeral=True,
+        )
+        return
+
+    female_role = guild.get_role(FEMALE_ROLE_ID)
+    male_role = guild.get_role(MALE_ROLE_ID)
+
+    if room_kind == "yuri":
+        required_role = female_role
+        opposite_role = male_role
+        category_id = int(settings["yuri_category_id"])
+        room_name = f"🌸｜百合｜{owner.display_name}"
+        room_type = "yuri_pair"
+        label = "百合"
+    else:
+        required_role = male_role
+        opposite_role = female_role
+        category_id = int(settings["bl_category_id"])
+        room_name = f"🖤｜BL｜{owner.display_name}"
+        room_type = "bl_pair"
+        label = "BL"
+
+    if required_role is None:
+        await interaction.followup.send(
+            f"{label}部屋に必要な性別ロールが見つかりません。",
+            ephemeral=True,
+        )
+        return
+
+    if required_role not in owner.roles:
+        await interaction.followup.send(
+            f"このボタンは {required_role.mention} を持っているメンバー専用です。",
+            ephemeral=True,
+        )
+        return
+
+    category = get_category(guild, category_id)
+    if category is None:
+        await interaction.followup.send(
+            f"{label}部屋の作成先カテゴリーが見つかりません。管理者に確認してください。",
+            ephemeral=True,
+        )
+        return
+
+    # 1人1部屋制限
+    for room_row in all_rooms():
+        if (
+            int(room_row["guild_id"]) == guild.id
+            and int(room_row["owner_id"]) == owner.id
+        ):
+            existing = guild.get_channel(int(room_row["channel_id"]))
+            if isinstance(existing, discord.VoiceChannel):
+                await interaction.followup.send(
+                    f"すでに {existing.mention} を作成しています。",
+                    ephemeral=True,
+                )
+                return
+
+    channel = await create_room(
+        interaction,
+        RoomSpec(
+            name=room_name,
+            category_id=category_id,
+            room_type=room_type,
+            public_view=False,
+            public_connect=False,
+            user_limit=2,
+        ),
+    )
+    if channel is None:
+        return
+
+    # 同性ロールだけ閲覧・接続可能
+    try:
+        await channel.set_permissions(
+            required_role,
+            view_channel=True,
+            connect=True,
+            speak=True,
+            stream=True,
+            use_voice_activation=True,
+            send_messages=True,
+            read_message_history=True,
+            use_application_commands=True,
+            reason=f"{label}専用部屋",
+        )
+        if opposite_role:
+            await channel.set_permissions(
+                opposite_role,
+                view_channel=False,
+                connect=False,
+                reason=f"{label}専用部屋のため非表示",
+            )
+
+        # 作成者のブラックリストは個別に非表示
+        for blocked_id in set(get_pairs("blacklist", owner.id)):
+            blocked = guild.get_member(blocked_id)
+            if blocked:
+                await channel.set_permissions(
+                    blocked,
+                    view_channel=False,
+                    connect=False,
+                    reason="作成者のブラックリスト",
+                )
+    except (discord.Forbidden, discord.HTTPException):
+        log.exception("%s部屋の権限設定失敗: %s", label, channel.id)
+
+    await interaction.followup.send(
+        f"✅ {channel.mention} を作成しました。\n"
+        f"{required_role.mention} のみ閲覧・接続できます。\n"
+        "定員は2人です。",
+        ephemeral=True,
+    )
+
+
+class YuriBLPanel(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="百合部屋を作成",
+        emoji="🌸",
+        style=discord.ButtonStyle.danger,
+        custom_id="noir:yuri_bl:yuri",
+    )
+    async def yuri(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await create_yuri_bl_room(interaction, "yuri")
+
+    @discord.ui.button(
+        label="BL部屋を作成",
+        emoji="🖤",
+        style=discord.ButtonStyle.primary,
+        custom_id="noir:yuri_bl:bl",
+    )
+    async def bl(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await create_yuri_bl_room(interaction, "bl")
+
+
 # =========================================================
 # 公開エロイプ・ラジオ部屋
 # =========================================================
@@ -3727,6 +3945,7 @@ class NoirBot(commands.Bot):
         self.add_view(QuickPanel())
         self.add_view(PrivatePanel())
         self.add_view(PublicSpecialRoomPanel())
+        self.add_view(YuriBLPanel())
         self.add_view(DMRequestPanel())
         self.add_view(VCMenuView())
 
@@ -4045,6 +4264,79 @@ async def setup_recruitment_panels(interaction: discord.Interaction) -> None:
     await interaction.response.send_message("✅ 裏募集作成パネルを設置しました。", ephemeral=True)
 
 
+
+
+
+@bot.tree.command(
+    name="setup_yuri_bl_panel",
+    description="百合・BL専用部屋の作成パネルを設置します",
+)
+@app_commands.describe(
+    panel_channel="作成パネルを設置するテキストチャンネル",
+    yuri_category="百合部屋を作成するカテゴリー",
+    bl_category="BL部屋を作成するカテゴリー",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def setup_yuri_bl_panel(
+    interaction: discord.Interaction,
+    panel_channel: discord.TextChannel,
+    yuri_category: discord.CategoryChannel,
+    bl_category: discord.CategoryChannel,
+) -> None:
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.followup.send(
+            "サーバー内で使用してください。",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title="🌸🖤 百合・BL専用部屋",
+        description=(
+            "専用VCを作成できます。\n\n"
+            "🌸 **百合部屋**\n"
+            "女性ロールを持っている人だけ利用できます。\n"
+            f"作成先：{yuri_category.name}\n\n"
+            "🖤 **BL部屋**\n"
+            "男性ロールを持っている人だけ利用できます。\n"
+            f"作成先：{bl_category.name}\n\n"
+            "・定員2人\n"
+            "・作成者のブラックリストを反映\n"
+            "・部屋が空になると自動削除"
+        ),
+        color=discord.Color.from_rgb(210, 130, 190),
+    )
+
+    try:
+        message = await panel_channel.send(
+            embed=embed,
+            view=YuriBLPanel(),
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        log.exception("百合・BLパネル設置失敗")
+        await interaction.followup.send(
+            "パネルを設置できませんでした。Botの権限を確認してください。",
+            ephemeral=True,
+        )
+        return
+
+    save_yuri_bl_settings(
+        guild.id,
+        panel_channel.id,
+        yuri_category.id,
+        bl_category.id,
+        message.id,
+    )
+
+    await interaction.followup.send(
+        "✅ 百合・BL専用部屋パネルを設置しました。\n"
+        f"🌸 百合 → **{yuri_category.name}**\n"
+        f"🖤 BL → **{bl_category.name}**",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(
