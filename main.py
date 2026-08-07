@@ -155,6 +155,14 @@ def init_db() -> None:
             );
 
 
+            CREATE TABLE IF NOT EXISTS anonymous_post_settings (
+                guild_id INTEGER PRIMARY KEY,
+                panel_channel_id INTEGER NOT NULL,
+                post_channel_id INTEGER NOT NULL,
+                log_channel_id INTEGER NOT NULL DEFAULT 0,
+                panel_message_id INTEGER NOT NULL DEFAULT 0
+            );
+
             CREATE TABLE IF NOT EXISTS yuri_bl_settings (
                 guild_id INTEGER PRIMARY KEY,
                 panel_channel_id INTEGER NOT NULL,
@@ -725,6 +733,45 @@ def get_yuri_bl_settings(guild_id: int) -> Optional[sqlite3.Row]:
     with db_connect() as con:
         return con.execute(
             "SELECT * FROM yuri_bl_settings WHERE guild_id=?",
+            (guild_id,),
+        ).fetchone()
+
+
+
+def save_anonymous_post_settings(
+    guild_id: int,
+    panel_channel_id: int,
+    post_channel_id: int,
+    log_channel_id: int = 0,
+    panel_message_id: int = 0,
+) -> None:
+    with db_connect() as con:
+        con.execute(
+            """
+            INSERT INTO anonymous_post_settings(
+                guild_id, panel_channel_id, post_channel_id,
+                log_channel_id, panel_message_id
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                panel_channel_id=excluded.panel_channel_id,
+                post_channel_id=excluded.post_channel_id,
+                log_channel_id=excluded.log_channel_id,
+                panel_message_id=excluded.panel_message_id
+            """,
+            (
+                guild_id,
+                panel_channel_id,
+                post_channel_id,
+                log_channel_id,
+                panel_message_id,
+            ),
+        )
+
+
+def get_anonymous_post_settings(guild_id: int) -> Optional[sqlite3.Row]:
+    with db_connect() as con:
+        return con.execute(
+            "SELECT * FROM anonymous_post_settings WHERE guild_id=?",
             (guild_id,),
         ).fetchone()
 
@@ -2267,6 +2314,175 @@ class QuickPanel(discord.ui.View):
         await self.open_select(interaction, "private_qm", "裏QMのタイプを選択してください。")
 
 
+
+
+
+# =========================================================
+# 匿名投稿・遠隔リンク
+# =========================================================
+
+def valid_http_url(value: str) -> bool:
+    value = value.strip().lower()
+    return value.startswith("https://") or value.startswith("http://")
+
+
+class AnonymousPostModal(discord.ui.Modal):
+    def __init__(self) -> None:
+        super().__init__(title="匿名投稿")
+
+        self.post_title = discord.ui.TextInput(
+            label="タイトル",
+            placeholder="例：今夜ゆっくり話せる人",
+            required=False,
+            max_length=100,
+        )
+        self.body = discord.ui.TextInput(
+            label="投稿内容",
+            placeholder="匿名で投稿したい内容を書いてください",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=1800,
+        )
+        self.remote_link = discord.ui.TextInput(
+            label="遠隔リンク（任意）",
+            placeholder="https:// から始まるリンク",
+            required=False,
+            max_length=500,
+        )
+
+        self.add_item(self.post_title)
+        self.add_item(self.body)
+        self.add_item(self.remote_link)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            await interaction.followup.send(
+                "サーバー内で使用してください。",
+                ephemeral=True,
+            )
+            return
+
+        settings = get_anonymous_post_settings(guild.id)
+        if settings is None:
+            await interaction.followup.send(
+                "匿名投稿の設定がありません。管理者に確認してください。",
+                ephemeral=True,
+            )
+            return
+
+        post_channel = get_text_channel(guild, int(settings["post_channel_id"]))
+        if post_channel is None:
+            await interaction.followup.send(
+                "匿名投稿先チャンネルが見つかりません。",
+                ephemeral=True,
+            )
+            return
+
+        link = str(self.remote_link.value).strip()
+        if link and not valid_http_url(link):
+            await interaction.followup.send(
+                "遠隔リンクは `https://` または `http://` から始まるURLを入力してください。",
+                ephemeral=True,
+            )
+            return
+
+        title = str(self.post_title.value).strip() or "匿名投稿"
+        body = str(self.body.value).strip()
+
+        embed = discord.Embed(
+            title=f"🎭 {title}",
+            description=body,
+            color=discord.Color.dark_purple(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_author(name="Anonymous")
+        embed.set_footer(text="投稿者情報は一般公開されません")
+
+        view = None
+        if link:
+            view = discord.ui.View(timeout=None)
+            view.add_item(
+                discord.ui.Button(
+                    label="遠隔リンクを開く",
+                    emoji="🔗",
+                    style=discord.ButtonStyle.link,
+                    url=link,
+                )
+            )
+
+        try:
+            posted = await post_channel.send(
+                embed=embed,
+                view=view,
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            log.exception("匿名投稿送信失敗")
+            await interaction.followup.send(
+                "匿名投稿を送信できませんでした。",
+                ephemeral=True,
+            )
+            return
+
+        log_channel_id = int(settings["log_channel_id"])
+        log_channel = (
+            get_text_channel(guild, log_channel_id)
+            if log_channel_id
+            else None
+        )
+        if log_channel:
+            try:
+                log_embed = discord.Embed(
+                    title="🛡️ 匿名投稿ログ",
+                    description=body[:1800],
+                    color=discord.Color.dark_grey(),
+                    timestamp=datetime.now(timezone.utc),
+                )
+                log_embed.add_field(
+                    name="投稿者",
+                    value=f"{member.mention} (`{member.id}`)",
+                    inline=False,
+                )
+                log_embed.add_field(
+                    name="公開投稿",
+                    value=posted.jump_url,
+                    inline=False,
+                )
+                if link:
+                    log_embed.add_field(
+                        name="遠隔リンク",
+                        value=link[:1024],
+                        inline=False,
+                    )
+                await log_channel.send(embed=log_embed)
+            except discord.HTTPException:
+                log.exception("匿名投稿ログ送信失敗")
+
+        await interaction.followup.send(
+            f"✅ 匿名で投稿しました。\n{posted.jump_url}",
+            ephemeral=True,
+        )
+
+
+class AnonymousPostPanel(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="匿名で投稿する",
+        emoji="🎭",
+        style=discord.ButtonStyle.primary,
+        custom_id="noir:anonymous_post:start",
+    )
+    async def start(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await interaction.response.send_modal(AnonymousPostModal())
 
 
 # =========================================================
@@ -3946,6 +4162,7 @@ class NoirBot(commands.Bot):
         self.add_view(PrivatePanel())
         self.add_view(PublicSpecialRoomPanel())
         self.add_view(YuriBLPanel())
+        self.add_view(AnonymousPostPanel())
         self.add_view(DMRequestPanel())
         self.add_view(VCMenuView())
 
@@ -4265,6 +4482,75 @@ async def setup_recruitment_panels(interaction: discord.Interaction) -> None:
 
 
 
+
+
+
+@bot.tree.command(
+    name="setup_anonymous_post_panel",
+    description="匿名投稿パネルを設置します",
+)
+@app_commands.describe(
+    panel_channel="匿名投稿ボタンを設置するチャンネル",
+    post_channel="匿名投稿を表示するチャンネル",
+    log_channel="投稿者を確認できる管理ログチャンネル（任意）",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def setup_anonymous_post_panel(
+    interaction: discord.Interaction,
+    panel_channel: discord.TextChannel,
+    post_channel: discord.TextChannel,
+    log_channel: Optional[discord.TextChannel] = None,
+) -> None:
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.followup.send(
+            "サーバー内で使用してください。",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title="🎭 匿名投稿",
+        description=(
+            "下のボタンから匿名で投稿できます。\n\n"
+            "・投稿者名は一般公開されません\n"
+            "・タイトルと本文を入力できます\n"
+            "・遠隔リンクは任意で追加できます\n"
+            "・リンクを入れると、投稿の下に"
+            " **🔗 遠隔リンクを開く** ボタンが表示されます"
+        ),
+        color=discord.Color.dark_purple(),
+    )
+
+    try:
+        message = await panel_channel.send(
+            embed=embed,
+            view=AnonymousPostPanel(),
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        log.exception("匿名投稿パネル設置失敗")
+        await interaction.followup.send(
+            "匿名投稿パネルを設置できませんでした。",
+            ephemeral=True,
+        )
+        return
+
+    save_anonymous_post_settings(
+        guild.id,
+        panel_channel.id,
+        post_channel.id,
+        log_channel.id if log_channel else 0,
+        message.id,
+    )
+
+    await interaction.followup.send(
+        "✅ 匿名投稿パネルを設置しました。\n"
+        f"投稿先：{post_channel.mention}"
+        + (f"\n管理ログ：{log_channel.mention}" if log_channel else ""),
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(
