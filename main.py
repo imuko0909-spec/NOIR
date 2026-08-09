@@ -2907,13 +2907,11 @@ class NowRecruitModal(discord.ui.Modal):
         embed.add_field(name="プロフィール", value=profile_text, inline=False)
         embed.add_field(name="一言", value=str(self.comment.value), inline=False)
         embed.set_thumbnail(url=member.display_avatar.url)
-        embed.set_footer(text="💞 立候補ボタンから応募できます")
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         message = await channel.send(
             content=mention or None,
             embed=embed,
-            view=RecruitActionView(),
             allowed_mentions=discord.AllowedMentions(roles=True, users=True),
         )
         save_now_recruitment(message.id, member.id, self.target_type, str(self.comment.value))
