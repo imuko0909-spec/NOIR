@@ -155,6 +155,13 @@ def init_db() -> None:
             );
 
 
+            CREATE TABLE IF NOT EXISTS new_people_room_settings (
+                guild_id INTEGER PRIMARY KEY,
+                panel_channel_id INTEGER NOT NULL,
+                category_id INTEGER NOT NULL,
+                panel_message_id INTEGER NOT NULL DEFAULT 0
+            );
+
             CREATE TABLE IF NOT EXISTS anonymous_post_settings (
                 guild_id INTEGER PRIMARY KEY,
                 panel_channel_id INTEGER NOT NULL,
@@ -772,6 +779,35 @@ def get_anonymous_post_settings(guild_id: int) -> Optional[sqlite3.Row]:
     with db_connect() as con:
         return con.execute(
             "SELECT * FROM anonymous_post_settings WHERE guild_id=?",
+            (guild_id,),
+        ).fetchone()
+
+
+def save_new_people_room_settings(
+    guild_id: int,
+    panel_channel_id: int,
+    category_id: int,
+    panel_message_id: int = 0,
+) -> None:
+    with db_connect() as con:
+        con.execute(
+            """
+            INSERT INTO new_people_room_settings(
+                guild_id, panel_channel_id, category_id, panel_message_id
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                panel_channel_id=excluded.panel_channel_id,
+                category_id=excluded.category_id,
+                panel_message_id=excluded.panel_message_id
+            """,
+            (guild_id, panel_channel_id, category_id, panel_message_id),
+        )
+
+
+def get_new_people_room_settings(guild_id: int) -> Optional[sqlite3.Row]:
+    with db_connect() as con:
+        return con.execute(
+            "SELECT * FROM new_people_room_settings WHERE guild_id=?",
             (guild_id,),
         ).fetchone()
 
@@ -2315,6 +2351,84 @@ class QuickPanel(discord.ui.View):
 
 
 
+
+
+# =========================================================
+# 新規開拓部屋
+# =========================================================
+
+async def create_new_people_room(
+    interaction: discord.Interaction,
+    user_limit: int,
+) -> None:
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    guild = interaction.guild
+    owner = interaction.user
+    if guild is None or not isinstance(owner, discord.Member):
+        await interaction.followup.send("サーバー内で使用してください。", ephemeral=True)
+        return
+
+    settings = get_new_people_room_settings(guild.id)
+    if settings is None:
+        await interaction.followup.send(
+            "新規開拓部屋の設定がありません。管理者に確認してください。",
+            ephemeral=True,
+        )
+        return
+
+    category_id = int(settings["category_id"])
+
+    channel = await create_room(
+        interaction,
+        RoomSpec(
+            name=f"🌱｜新規開拓{user_limit}人｜{owner.display_name}",
+            category_id=category_id,
+            room_type=f"new_people_{user_limit}",
+            public_view=True,
+            public_connect=True,
+            user_limit=user_limit,
+        ),
+    )
+    if channel is None:
+        return
+
+    await interaction.followup.send(
+        f"✅ {channel.mention} を作成しました。定員は **{user_limit}人** です。",
+        ephemeral=True,
+    )
+
+
+class NewPeopleRoomPanel(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="3人部屋",
+        emoji="3️⃣",
+        style=discord.ButtonStyle.success,
+        custom_id="noir:new_people:3",
+    )
+    async def room3(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await create_new_people_room(interaction, 3)
+
+    @discord.ui.button(
+        label="4人部屋",
+        emoji="4️⃣",
+        style=discord.ButtonStyle.primary,
+        custom_id="noir:new_people:4",
+    )
+    async def room4(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await create_new_people_room(interaction, 4)
+
+    @discord.ui.button(
+        label="5人部屋",
+        emoji="5️⃣",
+        style=discord.ButtonStyle.secondary,
+        custom_id="noir:new_people:5",
+    )
+    async def room5(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await create_new_people_room(interaction, 5)
 
 
 # =========================================================
@@ -4161,6 +4275,7 @@ class NoirBot(commands.Bot):
         self.add_view(PublicSpecialRoomPanel())
         self.add_view(YuriBLPanel())
         self.add_view(AnonymousPostPanel())
+        self.add_view(NewPeopleRoomPanel())
         self.add_view(DMRequestPanel())
         self.add_view(VCMenuView())
 
@@ -4481,6 +4596,56 @@ async def setup_recruitment_panels(interaction: discord.Interaction) -> None:
 
 
 
+
+
+@bot.tree.command(
+    name="setup_new_people_panel",
+    description="新規開拓3人・4人・5人部屋の作成パネルを設置します",
+)
+@app_commands.describe(
+    panel_channel="作成ボタンを設置するテキストチャンネル",
+    category="新規開拓VCを作成するカテゴリー",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def setup_new_people_panel(
+    interaction: discord.Interaction,
+    panel_channel: discord.TextChannel,
+    category: discord.CategoryChannel,
+) -> None:
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    if interaction.guild is None:
+        await interaction.followup.send("サーバー内で使用してください。", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🌱 新規開拓部屋",
+        description=(
+            "人数を選んで新規開拓VCを作成できます。\n\n"
+            "3️⃣ 3人部屋\n"
+            "4️⃣ 4人部屋\n"
+            "5️⃣ 5人部屋\n\n"
+            f"作成先：**{category.name}**"
+        ),
+        color=discord.Color.green(),
+    )
+
+    message = await panel_channel.send(
+        embed=embed,
+        view=NewPeopleRoomPanel(),
+    )
+
+    save_new_people_room_settings(
+        interaction.guild.id,
+        panel_channel.id,
+        category.id,
+        message.id,
+    )
+
+    await interaction.followup.send(
+        f"✅ 新規開拓パネルを設置しました。作成先：**{category.name}**",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(
